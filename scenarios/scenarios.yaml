@@ -1,0 +1,151 @@
+# =============================================================================
+# Scenario definitions for autocallable model comparison.
+#
+# Each scenario specifies only what changes from the base config (config.yaml).
+# All other parameters are inherited unchanged.
+#
+# Two groups:
+#   market  — vary the vol surface; product structure is fixed
+#   product — vary the product structure; vol surface is fixed (base case)
+#
+# Spread (bp) = (max model price − min model price) × 10,000
+# A large spread signals high model risk for that scenario.
+# =============================================================================
+
+base_config: config.yaml   # Path to base config (relative to project root)
+
+scenarios:
+
+  # ── Group 1: Market scenarios ───────────────────────────────────────────────
+  # Hold the product structure fixed and vary the vol surface.
+  # Tests: does a steeper skew / higher vol / different term structure
+  # widen or narrow the gap between Local Vol, Heston, and SABR?
+
+  - name: Base case
+    group: market
+    description: >
+      Benchmark. Term-structure surface with vol_short=25%, vol_long=18%,
+      skew=-0.10 at 1y. Step-down snowball autocall.
+
+  - name: High vol
+    group: market
+    description: >
+      Both short and long vol raised by +7%. Models must work harder to
+      fit the higher level; stochastic-vol models may diverge more.
+    overrides:
+      vol_surface:
+        vol_short: 0.35
+        vol_long: 0.25
+
+  - name: Low vol
+    group: market
+    description: >
+      Calm market: vol_short=18%, vol_long=14%. Skew effects are smaller
+      in absolute terms; model spread expected to compress.
+    overrides:
+      vol_surface:
+        vol_short: 0.18
+        vol_long: 0.14
+
+  - name: Steep skew
+    group: market
+    description: >
+      Skew doubled to -0.20 at 1y (effective -0.28 at 6m). Represents
+      a stressed or post-crash environment with large put premium.
+      Model disagreement on skew dynamics should widen the spread.
+    overrides:
+      vol_surface:
+        skew: -0.20
+
+  - name: Flat skew
+    group: market
+    description: >
+      Near-zero skew (-0.03) and no convexity. All models should converge
+      as the surface approaches a flat smile. Useful as a lower-bound
+      reference for model spread.
+    overrides:
+      vol_surface:
+        skew: -0.03
+        convexity: 0.00
+
+  - name: Inverted term structure
+    group: market
+    description: >
+      Short-term vol (15%) is BELOW long-term vol (25%) — contango vol term
+      structure as seen in low-volatility regimes with rising uncertainty.
+      Tests whether models handle an upward-sloping ATM curve differently.
+    overrides:
+      vol_surface:
+        vol_short: 0.15
+        vol_long: 0.25
+        kappa: 1.0
+
+  # ── Group 2: Product scenarios ──────────────────────────────────────────────
+  # Hold the vol surface fixed at the base case and vary the product structure.
+  # Tests: which product features make pricing most sensitive to model choice?
+
+  - name: ATM autocall barrier
+    group: product
+    description: >
+      Single ATM barrier (100%) on all dates — note autocalls the moment the
+      underlying is at or above its initial level. More likely to autocall early,
+      so path dependency is lighter and model spread should be smaller.
+    overrides:
+      product:
+        autocall_barriers: 1.00
+
+  - name: Deep step-down barrier
+    group: product
+    description: >
+      Autocall barriers start at 90% and step down to 70% — more relaxed than
+      the base case (80%→60%). Higher autocall probability at each date.
+      Lighter capital risk but coupons accumulate more slowly.
+    overrides:
+      product:
+        autocall_barriers: [0.90, 0.90, 0.85, 0.80, 0.75, 0.70]
+
+  - name: Tight KI barrier
+    group: product
+    description: >
+      Capital barrier raised to 80% — investor loses capital if the stock
+      finishes below 80% of initial level at maturity. Much more likely to
+      be breached than the base 60%. Models differ most on the probability of
+      a moderate drawdown (60–80%), so spread is expected to widen.
+    overrides:
+      product:
+        capital_barrier: 0.80
+
+  - name: No KI (capital protected)
+    group: product
+    description: >
+      Capital barrier disabled — full notional always returned at maturity.
+      Eliminates the embedded put option. Removes the main source of
+      path-dependency that drives model disagreement at long maturities.
+    overrides:
+      product:
+        capital_barrier_active: false
+
+  - name: Phoenix structure
+    group: product
+    description: >
+      Switches from standard autocall (coupon on exit only) to Phoenix
+      (periodic coupon paid whenever stock > 80% of initial level, even
+      without autocall). Flat 7% coupon per period — not accumulated.
+      The periodic coupon embeds a series of binary options, which are
+      particularly sensitive to skew dynamics.
+    overrides:
+      product:
+        conditional_coupon: true
+        coupon_rate: 0.07       # flat per period (not snowball)
+        coupon_barrier: 0.80
+
+  - name: High coupon snowball
+    group: product
+    description: >
+      Coupon rate doubled vs base (14% per period accumulated: 14%, 28%, ...,
+      84%). The note is deeply in-the-money from the investor's perspective
+      if it survives to late dates, making the capital-at-risk feature
+      even more painful. Tests whether model disagreement scales with coupon.
+    overrides:
+      product:
+        coupon_rate: [0.14, 0.28, 0.42, 0.56, 0.70, 0.84]

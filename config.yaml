@@ -1,0 +1,227 @@
+# =============================================================================
+# Autocallable Pricer — Configuration File
+#
+# All rates and vols are expressed as decimals (0.20 = 20%).
+# All barriers and coupons are expressed as fractions of notional or spot.
+# All times are in years.
+# =============================================================================
+
+
+# ── Market parameters ─────────────────────────────────────────────────────────
+market:
+  spot: 100.0       # Current price of the underlying asset (S₀).
+                    # Used as the reference level for all performance calculations:
+                    # performance at time t = S(t) / spot.
+
+  rate: 0.03        # Continuously compounded risk-free rate (r).
+                    # Example: 0.03 = 3% p.a.
+                    # Used for: discounting cashflows (df = exp(-r·t)) and
+                    # computing risk-neutral drift of the underlying.
+
+  div_yield: 0.01   # Continuous dividend yield (q).
+                    # Example: 0.01 = 1% p.a.
+                    # Risk-neutral drift of the underlying is (r - q),
+                    # so higher div_yield → lower expected growth → lower autocall probability.
+
+
+# ── Simulation parameters ─────────────────────────────────────────────────────
+simulation:
+  n_paths: 10000    # Number of Monte Carlo paths.
+                    # More paths → smaller standard error but longer runtime.
+                    # Standard error ≈ σ / √n_paths, where σ is the payoff std dev.
+                    # Rule of thumb: 10,000 → ~1–2bp SE; 100,000 → ~0.3–0.5bp SE.
+
+  seed: 42          # Random seed for reproducibility.
+                    # Change this to check MC stability across different random draws.
+                    # Two runs with the same seed produce identical results.
+
+  antithetic: true  # Antithetic variates variance reduction.
+                    # For each path Z, also simulate −Z. Halves the effective
+                    # variance of smooth payoffs at almost no extra cost.
+                    # Recommended: keep true unless debugging.
+
+
+# ── Volatility surface ────────────────────────────────────────────────────────
+#
+# The vol surface defines σ_imp(T, K): the Black-Scholes implied vol for each
+# (maturity T, strike K) pair. Models are calibrated to this surface, so its
+# shape directly determines how each model prices the autocallable.
+#
+# Surface types:
+#   "term_structure" — recommended for realistic pricing. Has both an ATM vol
+#                      term structure and a skew that steepens at short maturities.
+#   "skewed"         — flat ATM vol across all maturities, constant skew.
+#                      Simpler but unrealistic: the same skew at 6m and 3y.
+#   "flat"           — constant vol everywhere. Use only for model unit-testing.
+#
+vol_surface:
+  type: term_structure
+
+  # --- ATM volatility term structure ---
+  # Formula: σ_atm(T) = vol_long + (vol_short − vol_long) × exp(−kappa × T)
+  # This gives an exponential interpolation from vol_short (at T→0)
+  # to vol_long (at T→∞), with kappa controlling the speed of convergence.
+  #
+  vol_short: 0.25   # ATM implied vol as T → 0 (very short maturities).
+                    # Typically higher than vol_long due to short-term event risk
+                    # (earnings, macro announcements). Example: 0.25 = 25%.
+
+  vol_long: 0.18    # ATM implied vol as T → ∞ (long-run equilibrium level).
+                    # Represents the market's expectation of long-run realised vol.
+                    # Example: 0.18 = 18%.
+
+  kappa: 1.5        # Speed of mean-reversion for the ATM term structure.
+                    # Half-life of the short-term premium ≈ ln(2)/kappa years.
+                    # kappa=1.5 → half-life ≈ 0.46y (convergence mostly done by ~2y).
+                    # Higher kappa → quicker convergence from vol_short to vol_long.
+
+  # --- Skew term structure ---
+  # Formula: skew(T) = skew / √T
+  # The skew steepens at short maturities (steep 6m skew, flat 3y skew),
+  # which matches the empirically observed behaviour in equity markets.
+  # The parameter below is the reference level at T = 1 year.
+  #
+  # Implied vol at strike K: σ(T,K) = σ_atm(T) + skew(T)·ln(K/F(T)) + convexity·ln(K/F(T))²
+  # where F(T) = spot × exp((rate − div_yield) × T) is the forward price.
+  #
+  skew: -0.10       # Skew slope at T = 1y, in units of vol per unit of log-moneyness.
+                    # Example: skew = −0.10 means that a 10% OTM put (ln(K/F) ≈ −0.10)
+                    # has ~1% higher implied vol than ATM at the 1-year point.
+                    # Negative → downward slope (equity-like put premium).
+                    # At T = 0.5y: effective skew = −0.10/√0.5 ≈ −0.141 (steeper).
+                    # At T = 2.0y: effective skew = −0.10/√2.0 ≈ −0.071 (flatter).
+
+  # --- Smile convexity ---
+  # Adds a symmetric U-shaped curvature on top of the skew (both OTM puts and
+  # OTM calls have higher vol than the linear-skew prediction).
+  # Formula contribution: convexity × ln(K/F)²
+  #
+  convexity: 0.02   # Curvature coefficient (vol per unit of log-moneyness squared).
+                    # Example: convexity = 0.02 adds +0.02 × 0.1² = +0.02% vol at
+                    # 10% OTM. Small effect near ATM; grows for deep OTM strikes.
+                    # Set to 0.0 for a pure skew (no smile convexity).
+
+  T_max: 5.0        # Maximum maturity covered by the surface grid (years).
+                    # Must be ≥ product maturity. The surface is built on a fine
+                    # grid from ~0 to T_max and interpolated for intermediate points.
+
+
+# ── Product specification ─────────────────────────────────────────────────────
+#
+# This section defines the autocallable note's payoff structure.
+# The pricer supports three common variants through combinations of these fields:
+#
+#   Standard autocall : conditional_coupon = false
+#   Phoenix autocall  : conditional_coupon = true
+#   Snowball          : pass a list to coupon_rate (accumulated coupons)
+#
+product:
+  notional: 1.0     # Face value of the note. All prices are expressed per unit
+                    # notional, so 1.0 (= 100%) is the standard choice.
+                    # A price of 1.05 means the note is worth 105% of face value.
+
+  maturity: 3.0     # Final maturity of the note in years.
+                    # The last entry in observation_dates must equal this value.
+
+  # Observation dates (years): the dates at which the autocall condition is checked.
+  # Must be strictly increasing and end exactly at maturity.
+  # Example below: semi-annual observations over 3 years.
+  observation_dates: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+  # --- Autocall barriers ---
+  # The note autocalls (terminates early) on observation date t_i if:
+  #   S(t_i) / spot  ≥  autocall_barriers[i]
+  #
+  # Scalar → same barrier on every observation date.
+  # List   → one barrier per date (step-down schedule below):
+  #   - barriers start high and step down over time
+  #   - investor accepts lower performance to achieve autocall in later periods
+  #
+  # Example below (step-down): note autocalls at 80% of initial spot for the
+  # first two observations, then steps down to 60% by maturity.
+  autocall_barriers: [0.80, 0.80, 0.75, 0.70, 0.65, 0.60]
+
+  # --- Coupon on autocall ---
+  # Cash amount paid to the investor when the note autocalls, as a fraction of notional.
+  # Payment = coupon_rate[i] × notional, paid at time t_i.
+  #
+  # Scalar → same coupon on every date (e.g. 0.07 = 7% whenever it autocalls).
+  # List   → one coupon per date. Use increasing values for a snowball structure
+  #          where missed coupons accumulate:
+  #   [0.07, 0.14, 0.21, 0.28, 0.35, 0.42] means:
+  #     autocall at 0.5y → investor receives 7%  of notional
+  #     autocall at 1.0y → investor receives 14% of notional (= 2 × 7%)
+  #     autocall at 1.5y → investor receives 21% of notional (= 3 × 7%)  ...etc.
+  coupon_rate: [0.07, 0.14, 0.21, 0.28, 0.35, 0.42]
+
+  # --- Phoenix structure (conditional periodic coupon) ---
+  # When conditional_coupon = true, a coupon is paid at each observation date
+  # where the underlying is above coupon_barrier, even without autocall.
+  # This converts the product from a "coupon on exit" structure to a
+  # "periodic income" structure.
+  #
+  # conditional_coupon = false → Standard autocall (coupon only on autocall).
+  # conditional_coupon = true  → Phoenix autocall  (periodic coupon if above barrier).
+  conditional_coupon: false
+
+  coupon_barrier: 0.80  # Performance threshold for Phoenix coupon payments.
+                        # Only used when conditional_coupon = true.
+                        # At each observation: if S(t_i)/spot ≥ coupon_barrier,
+                        # investor receives coupon_rate[i] × notional.
+                        # Example: 0.80 = coupon paid as long as stock > 80% of initial level.
+
+  # --- Capital protection at maturity ---
+  # If the note has not autocalled by maturity and capital_barrier_active = true,
+  # the final payoff depends on whether the underlying breached the capital barrier:
+  #
+  #   S(T) / spot  ≥  capital_barrier  →  investor receives full notional (100%)
+  #   S(T) / spot  <  capital_barrier  →  investor receives notional × S(T)/spot
+  #                                        (capital loss proportional to the fall)
+  #
+  # This is a "European down-and-in put" embedded in the note.
+  # capital_barrier_active = false → full notional always returned at maturity.
+  #
+  capital_barrier_active: true
+
+  capital_barrier: 0.60  # Knock-in level as a fraction of initial spot.
+                          # Example: 0.60 = investor loses capital only if the
+                          # stock finishes more than 40% below its initial level.
+
+
+# ── Models to run ─────────────────────────────────────────────────────────────
+#
+# Three stochastic models are supported. Each is calibrated to the vol surface
+# above and then used to simulate the underlying paths for MC pricing.
+# Running multiple models reveals model risk: how much the price depends on the
+# assumed dynamics beyond what the vol surface constrains.
+#
+# Local Vol (Dupire):
+#   Deterministic vol function σ_loc(t, S) derived from the surface via Dupire's
+#   formula. Fits the surface exactly by construction. Produces a "sticky strike"
+#   smile dynamic, which tends to underestimate forward skew for path-dependent
+#   payoffs. Usually the lowest price for barrier/autocall products.
+#
+# Heston Stochastic Volatility:
+#   Vol itself is stochastic (mean-reverting CIR process). Parameters:
+#     kappa = mean-reversion speed of variance
+#     theta = long-run variance (long-run vol = √theta)
+#     xi    = vol-of-vol (how much instantaneous vol fluctuates)
+#     rho   = correlation between spot and vol Brownians
+#             (negative for equity: stock falls → vol spikes)
+#     v0    = initial variance (initial vol = √v0)
+#   Calibrated to the full vol surface (all strikes and maturities) via the
+#   Heston characteristic function. Single set of parameters for all maturities,
+#   so it may not fit both the short-term skew and long-term level simultaneously.
+#
+# SABR Stochastic Volatility:
+#   Similar to Heston but the vol process is log-normal rather than CIR.
+#   Parameters: alpha (initial vol level), beta (backbone, fixed = 1 = lognormal),
+#   rho (spot-vol correlation), nu (vol-of-vol).
+#   Calibrated to a single maturity slice (1y by default) via the Hagan formula.
+#   Extrapolates to other maturities using the same parameters, which can
+#   cause mispricing at maturities far from the calibration slice.
+#
+models:
+  local_vol: true   # Dupire Local Volatility
+  heston: true      # Heston Stochastic Volatility
+  sabr: true        # SABR Stochastic Volatility
