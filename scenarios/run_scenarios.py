@@ -55,6 +55,9 @@ def build_surface(cfg: dict, spot: float, rate: float, div_yield: float):
         return flat_surface(spot=spot, vol=vc["atm_vol"], rate=rate,
                             div_yield=div_yield, T_max=T_max)
     if kind == "term_structure":
+        lo = vc.get("moneyness_lo")
+        hi = vc.get("moneyness_hi")
+        m_range = (float(lo), float(hi)) if (lo is not None and hi is not None) else None
         return term_structure_surface(
             spot=spot, rate=rate, div_yield=div_yield, T_max=T_max,
             vol_short=vc.get("vol_short", 0.25),
@@ -62,6 +65,9 @@ def build_surface(cfg: dict, spot: float, rate: float, div_yield: float):
             kappa=vc.get("kappa", 1.5),
             skew=vc.get("skew", -0.10),
             convexity=vc.get("convexity", 0.02),
+            n_T=int(vc.get("n_T", 30)),
+            n_K=int(vc.get("n_K", 60)),
+            moneyness_range=m_range,
         )
     return skewed_surface(spot=spot, atm_vol=vc["atm_vol"], skew=vc.get("skew", 0.0),
                           rate=rate, div_yield=div_yield, T_max=T_max)

@@ -194,9 +194,9 @@ def term_structure_surface(
     rate: float = 0.0,
     div_yield: float = 0.0,
     T_max: float = 5.0,
-    n_T: int = 20,
-    n_K: int = 30,
-    moneyness_range: tuple[float, float] = (0.5, 1.5),
+    n_T: int = 30,
+    n_K: int = 60,
+    moneyness_range: tuple[float, float] | None = None,
 ) -> ImpliedVolSurface:
     """
     Realistic equity vol surface with ATM term structure, skew term structure,
@@ -219,7 +219,16 @@ def term_structure_surface(
         Negative → equity-like downward skew.
     convexity : float
         Symmetric smile curvature (coefficient of ln(K/F)²). Zero = pure skew.
+    moneyness_range : tuple | None
+        (lo, hi) as fractions of spot. If None, auto-sized to cover ±4.5σ of
+        a GBM path at T_max, ensuring >99.9% of simulated paths stay within
+        the surface and the local vol spline never has to extrapolate.
     """
+    if moneyness_range is None:
+        # ±4.5σ at T_max: covers >99.9% of paths so the spline never extrapolates
+        coverage = 4.5 * vol_short * np.sqrt(T_max)
+        moneyness_range = (max(0.05, np.exp(-coverage)), min(20.0, np.exp(coverage)))
+
     maturities = np.linspace(0.01, T_max, n_T)
     strikes = np.linspace(spot * moneyness_range[0], spot * moneyness_range[1], n_K)
 

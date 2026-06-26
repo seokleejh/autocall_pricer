@@ -12,6 +12,7 @@ without touching this file.
 import sys
 import os
 import argparse
+import subprocess
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -24,6 +25,71 @@ from models.heston import HestonModel, HestonParams
 from models.sabr import SABRModel, SABRParams
 from products.autocallable import AutocallableNote
 from engine.mc_pricer import MCPricer, compare_models
+from engine.heston_cf import heston_price_batch
+from engine.black_scholes import implied_vol as bs_implied_vol
+
+
+def quick_fit_check(surface, heston_params, sabr_params, spot, rate, div_yield) -> None:
+    """
+    Analytical fit quality check — no MC, completes in ~1 second.
+
+    Evaluates model-implied vols at a small (T, K) grid and reports
+    RMSE and worst-case error in basis points per model.
+
+    Heston: priced via characteristic function (exact).
+    SABR:   priced via Hagan asymptotic formula (exact for beta=1).
+    Local Vol: fits the surface by construction — always exact.
+    """
+    T_min, T_max = surface.maturity_range
+    maturities = sorted({
+        round(max(T_min + 0.01, T_max * 0.25), 2),
+        round(T_max * 0.5, 2),
+        float(T_max),
+    })
+    moneyness = [0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30]
+
+    print("Vol Surface Fit — Analytical Check")
+    print("  Local Vol   exact fit (by construction)")
+
+    checks = []
+    if heston_params is not None:
+        checks.append(("Heston", heston_params))
+    if sabr_params is not None:
+        checks.append(("SABR  ", sabr_params))
+
+    for label, params in checks:
+        errors, worst = [], (0.0, None, None)
+        for T in maturities:
+            F = float(surface.forward(T))
+            strikes = np.array([F * m for m in moneyness])
+            iv_mkt = np.array([surface.implied_vol(T, K) for K in strikes])
+
+            if label.startswith("Heston"):
+                p = params
+                prices = heston_price_batch(spot, strikes, T, rate, div_yield,
+                                            p.kappa, p.theta, p.xi, p.rho, p.v0)
+                iv_mdl = np.array([
+                    bs_implied_vol(float(pr), spot, float(K), T, rate, div_yield, is_call=True)
+                    for pr, K in zip(prices, strikes)
+                ])
+            else:
+                iv_mdl = np.array([
+                    params.hagan_implied_vol(F, float(K), T) for K in strikes
+                ])
+
+            for j, (mkt, mdl, K) in enumerate(zip(iv_mkt, iv_mdl, strikes)):
+                if not np.isnan(mdl):
+                    err = mdl - mkt
+                    errors.append(err)
+                    if abs(err) > abs(worst[0]):
+                        worst = (err, T, K / spot)
+
+        if errors:
+            rmse = np.sqrt(np.mean(np.array(errors) ** 2)) * 10_000
+            max_err = worst[0] * 10_000
+            print(f"  {label}  RMSE: {rmse:5.1f}bp  "
+                  f"max: {max_err:+6.1f}bp  (T={worst[1]:.1f}y, K/S={worst[2]:.0%})")
+    print()
 
 
 def load_config(path: str) -> dict:
@@ -39,6 +105,9 @@ def build_surface(cfg: dict, spot: float, rate: float, div_yield: float):
         return flat_surface(spot=spot, vol=vc["atm_vol"], rate=rate,
                             div_yield=div_yield, T_max=T_max)
     if kind == "term_structure":
+        lo = vc.get("moneyness_lo")
+        hi = vc.get("moneyness_hi")
+        m_range = (float(lo), float(hi)) if (lo is not None and hi is not None) else None
         return term_structure_surface(
             spot=spot, rate=rate, div_yield=div_yield, T_max=T_max,
             vol_short=vc.get("vol_short", 0.25),
@@ -46,6 +115,9 @@ def build_surface(cfg: dict, spot: float, rate: float, div_yield: float):
             kappa=vc.get("kappa", 1.5),
             skew=vc.get("skew", -0.10),
             convexity=vc.get("convexity", 0.02),
+            n_T=int(vc.get("n_T", 30)),
+            n_K=int(vc.get("n_K", 60)),
+            moneyness_range=m_range,
         )
     return skewed_surface(spot=spot, atm_vol=vc["atm_vol"], skew=vc.get("skew", 0.0),
                           rate=rate, div_yield=div_yield, T_max=T_max)
@@ -55,6 +127,13 @@ def main():
     parser = argparse.ArgumentParser(description="Autocallable note pricer")
     parser.add_argument("--config", default="config.yaml",
                         help="Path to YAML config file (default: config.yaml)")
+
+    fit_group = parser.add_mutually_exclusive_group()
+    fit_group.add_argument("--full-diagnostic", action="store_true",
+                           help="Run full MC vol surface diagnostic before pricing "
+                                "(slow — uses diagnostics/model_quality.py)")
+    fit_group.add_argument("--no-fit-check", action="store_true",
+                           help="Skip fit check entirely and go straight to pricing")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -106,6 +185,8 @@ def main():
     # ── Build pricers for selected models ─────────────────────────────────────
     models_cfg = cfg.get("models", {})
     pricers = []
+    heston_params = None
+    sabr_params = None
 
     if models_cfg.get("local_vol", True):
         lv_model = LocalVolModel(surface=surface, steps_per_year=52, seed=SEED)
@@ -140,6 +221,23 @@ def main():
     if not pricers:
         print("No models selected in config. Enable at least one under 'models:'.")
         sys.exit(1)
+
+    # ── Vol surface fit check ─────────────────────────────────────────────────
+    if args.full_diagnostic:
+        print()
+        print("Running full MC diagnostic (diagnostics/model_quality.py)...")
+        print("-" * 65)
+        subprocess.run(
+            [sys.executable, "-u", "diagnostics/model_quality.py", "--config", args.config],
+            check=True,
+        )
+        print("-" * 65)
+        print()
+    elif not args.no_fit_check:
+        quick_fit_check(surface,
+                        heston_params if models_cfg.get("heston", True) else None,
+                        sabr_params   if models_cfg.get("sabr",   True) else None,
+                        SPOT, RATE, DIV_YIELD)
 
     # ── Run comparison ────────────────────────────────────────────────────────
     print()
