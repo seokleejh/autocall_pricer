@@ -135,6 +135,62 @@ class ImpliedVolSurface:
     def local_vol(self, T: float, K: float, **kwargs) -> float:
         return float(np.sqrt(self.local_variance(T, K, **kwargs)))
 
+    def local_vol_batch(self, T: float, K: np.ndarray, dT: float = 1e-4) -> np.ndarray:
+        """
+        Vectorised Dupire local vol for an array of spot values at a fixed time T.
+        Avoids the Python loop overhead of calling local_vol() element-wise.
+        """
+        K = np.asarray(K, dtype=float)
+        dK = np.maximum(K * 1e-3, 1e-6)
+        F = self.forward(T)
+        y = np.log(K / F)
+
+        log_m     = np.log(K       / self.spot)
+        log_m_up  = np.log((K + dK) / self.spot)
+        log_m_dn  = np.log((K - dK) / self.spot)
+
+        n = len(K)
+        T_arr  = np.full(n, T,       dtype=float)
+        T_up   = np.full(n, T + dT,  dtype=float)
+        T_dn   = np.full(n, T - dT,  dtype=float)
+
+        def _w(t_arr, lm):
+            iv = np.maximum(self._spline(t_arr, lm, grid=False), 1e-6)
+            return iv ** 2 * t_arr
+
+        w       = _w(T_arr, log_m)
+        w_T_up  = _w(T_up,  log_m)
+        w_T_dn  = _w(T_dn,  log_m)
+        w_K_up  = _w(T_arr, log_m_up)
+        w_K_dn  = _w(T_arr, log_m_dn)
+
+        dw_dT   = (w_T_up - w_T_dn) / (2.0 * dT)
+        dw_dK   = (w_K_up - w_K_dn) / (2.0 * dK)
+        d2w_dK2 = (w_K_up - 2.0 * w + w_K_dn) / dK ** 2
+
+        dw_dy   = dw_dK * K
+        d2w_dy2 = d2w_dK2 * K ** 2 + dw_dK * K
+
+        denom = (1.0 - (y / w) * dw_dy
+                 + 0.25 * (-0.25 - 1.0 / w + y ** 2 / w ** 2) * dw_dy ** 2
+                 + 0.5 * d2w_dy2)
+        local_var = dw_dT / np.maximum(denom, 1e-8)
+        return np.sqrt(np.maximum(local_var, 1e-8))
+
+    def with_spot(self, new_spot: float) -> "ImpliedVolSurface":
+        """New surface with the same vol grid but a different spot (for spot-bump Greeks)."""
+        return ImpliedVolSurface(
+            self._T, self._K, self._vols.copy(),
+            new_spot, self.rate, self.div_yield,
+        )
+
+    def with_vol_shift(self, dvol: float) -> "ImpliedVolSurface":
+        """New surface with all implied vols shifted by dvol (for vega / vanna bumps)."""
+        return ImpliedVolSurface(
+            self._T, self._K, np.clip(self._vols + dvol, 1e-4, None),
+            self.spot, self.rate, self.div_yield,
+        )
+
 
 # ------------------------------------------------------------------
 # Factory helpers

@@ -28,6 +28,7 @@ def calibrate_heston(
     surface: ImpliedVolSurface,
     n_calibration_points: int = 36,
     initial_params: HestonParams | None = None,
+    fast: bool = False,
 ) -> HestonParams:
     """
     Calibrate Heston to the implied vol surface via full CF-based pricing.
@@ -91,8 +92,9 @@ def calibrate_heston(
                 n += 1
         return sse / max(n, 1)
 
-    res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds,
-                   options={"maxiter": 300, "ftol": 1e-12, "gtol": 1e-7})
+    opts = ({"maxiter": 80, "ftol": 1e-8, "gtol": 1e-5}
+            if fast else {"maxiter": 300, "ftol": 1e-12, "gtol": 1e-7})
+    res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds, options=opts)
 
     kappa, theta, xi, rho, v0 = res.x
     return HestonParams(kappa=kappa, theta=theta, xi=xi, rho=rho, v0=v0)

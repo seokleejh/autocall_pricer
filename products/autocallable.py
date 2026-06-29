@@ -168,3 +168,34 @@ class AutocallableNote:
                 pv[alive] += redeem * df
 
         return pv
+
+    def evaluate_duration(self, performances: np.ndarray) -> float:
+        """
+        Average time to termination (autocall or maturity) across MC paths.
+
+        Paths that autocall at observation t_i contribute t_i years.
+        Paths that survive all observations contribute maturity years.
+        The average is the risk-neutral expected duration of the note.
+
+        Parameters
+        ----------
+        performances : np.ndarray, shape (n_paths, n_obs)
+            Same array passed to evaluate_payoff — reuse without re-simulating.
+
+        Returns
+        -------
+        float : mean time to termination in years.
+        """
+        n_paths, n_obs = performances.shape
+        termination_times = np.full(n_paths, self.observation_dates[-1], dtype=float)
+        alive = np.ones(n_paths, dtype=bool)
+
+        for i, (t, barrier) in enumerate(
+            zip(self.observation_dates, self._autocall_barriers)
+        ):
+            autocalled = alive & (performances[:, i] >= barrier)
+            if autocalled.any():
+                termination_times[autocalled] = t
+                alive[autocalled] = False
+
+        return float(np.mean(termination_times))

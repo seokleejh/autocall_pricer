@@ -85,13 +85,10 @@ class LocalVolModel:
             dt = t_next - t_prev
             sqrt_dt = np.sqrt(dt)
 
-            # Local vol at current time and spot (mid-point approximation).
-            # Clamp to surface boundary: prevents cubic-spline extrapolation,
-            # which can give wildly wrong values for extreme path realisations.
             t_mid = 0.5 * (t_prev + t_next)
             K_lo, K_hi = self.surface.strike_range
             S_clamped = np.clip(S, K_lo, K_hi)
-            sig = np.vectorize(lambda s: self.surface.local_vol(t_mid, s))(S_clamped)
+            sig = self.surface.local_vol_batch(t_mid, S_clamped)
 
             Z = self.rng.standard_normal(draw_paths)
             S = S * np.exp((r - q - 0.5 * sig**2) * dt + sig * sqrt_dt * Z)
@@ -123,7 +120,7 @@ class LocalVolModel:
                 t_mid = 0.5 * (t_prev + t_next)
                 K_lo, K_hi = self.surface.strike_range
                 S_anti_clamped = np.clip(S_anti, K_lo, K_hi)
-                sig = np.vectorize(lambda s: self.surface.local_vol(t_mid, s))(S_anti_clamped)
+                sig = self.surface.local_vol_batch(t_mid, S_anti_clamped)
                 Z = rng2.standard_normal(draw_paths)
                 S_anti = S_anti * np.exp((r - q - 0.5 * sig**2) * dt + sig * sqrt_dt * (-Z))
                 S_anti = np.maximum(S_anti, 1e-6)
