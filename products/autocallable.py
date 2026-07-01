@@ -9,8 +9,14 @@ Supported structures (controlled by fields below):
   - Phoenix autocall:    conditional_coupon=True  (coupon paid if underlying > coupon_barrier)
   - Snowball/Step-down:  pass step_down list to autocall_barriers
 
-For worst-of basket (future): pass n_assets > 1 to the engine; the
-payoff functions here already operate on the minimum-performance asset.
+Worst-of basket support: implemented upstream in models/basket.py
+(BasketLocalVolModel / BasketHestonModel), which simulate correlated
+multi-asset paths and return the already-aggregated (min-across-assets)
+performance array -- evaluate_payoff() below never needs to know whether
+performances came from one asset or a worst-of basket. In basket mode,
+`spot` on this class is an unused placeholder (conventionally 1.0): all
+barriers here are performance fractions, and each asset's own spot lives
+on its own ImpliedVolSurface inside the basket model.
 """
 
 from __future__ import annotations

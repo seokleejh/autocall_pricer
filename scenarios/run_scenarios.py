@@ -30,6 +30,7 @@ from calibration.calibrators import calibrate_heston, calibrate_sabr
 from models.local_vol import LocalVolModel
 from models.heston import HestonModel, HestonParams
 from models.sabr import SABRModel, SABRParams
+from models.basket import BasketLocalVolModel, BasketHestonModel, BasketHestonAsset
 from products.autocallable import AutocallableNote
 from engine.mc_pricer import MCPricer
 
@@ -163,6 +164,99 @@ def build_pricers(cfg: dict, surface, spot: float, rate: float,
     return pricers
 
 
+# ── Basket helpers ──────────────────────────────────────────────────────────────
+
+def build_basket_surfaces(cfg: dict) -> list[tuple[str, object]]:
+    """Returns [(asset_name, surface), ...] built from cfg['assets']."""
+    result = []
+    for asset_cfg in cfg["assets"]:
+        spot = float(asset_cfg["spot"])
+        rate = float(asset_cfg["rate"])
+        div_yield = float(asset_cfg["div_yield"])
+        surf = build_surface({"vol_surface": asset_cfg["vol_surface"]}, spot, rate, div_yield)
+        result.append((asset_cfg["name"], surf))
+    return result
+
+
+def load_correlation(cfg: dict, n_assets: int) -> np.ndarray:
+    corr = np.array(cfg["correlation"], dtype=float)
+    assert corr.shape == (n_assets, n_assets), \
+        "correlation matrix size must match number of assets"
+    return corr
+
+
+def calibrate_basket_heston(
+    asset_surfaces: list[tuple[str, object]],
+    verbose: bool = False,
+    fast: bool = False,
+    warm_start: dict[str, HestonParams] | None = None,
+) -> dict[str, HestonParams]:
+    """Returns {asset_name: HestonParams}, one independent calibration per asset."""
+    result = {}
+    for name, surf in asset_surfaces:
+        init = warm_start.get(name) if warm_start else None
+        try:
+            params = calibrate_heston(surf, initial_params=init, fast=fast)
+            if verbose:
+                print(f"    {name}: kappa={params.kappa:.3f} theta={params.theta:.4f}"
+                      f" xi={params.xi:.3f} rho={params.rho:.3f}")
+        except Exception as e:
+            if verbose:
+                print(f"    {name}: Heston calibration failed ({e}), using defaults")
+            params = HestonParams() if init is None else init
+        result[name] = params
+    return result
+
+
+def build_basket_pricers(
+    cfg: dict,
+    asset_surfaces: list[tuple[str, object]],
+    correlation: np.ndarray,
+    seed: int,
+    antithetic: bool,
+    heston_params: dict[str, HestonParams] | None = None,
+) -> list[MCPricer]:
+    """Builds BasketLocalVolModel / BasketHestonModel pricers, mirroring build_pricers()."""
+    models_cfg = cfg.get("models", {})
+    pricers = []
+    surfaces = [s for _, s in asset_surfaces]
+
+    if models_cfg.get("local_vol", True):
+        m = BasketLocalVolModel(surfaces=surfaces, correlation=correlation, seed=seed)
+        pricers.append(MCPricer(m, "Basket Local Vol", antithetic))
+
+    if models_cfg.get("heston", True):
+        if heston_params is None:
+            heston_params = calibrate_basket_heston(asset_surfaces)
+        assets = [
+            BasketHestonAsset(name, heston_params[name], surf.spot, surf.rate, surf.div_yield)
+            for name, surf in asset_surfaces
+        ]
+        m = BasketHestonModel(assets=assets, correlation=correlation, seed=seed)
+        pricers.append(MCPricer(m, "Basket Heston", antithetic))
+
+    # SABR is not supported for basket pricing (see models/basket.py).
+    return pricers
+
+
+def build_basket_product(cfg: dict, discount_rate: float) -> AutocallableNote:
+    """Same as build_product() but spot is a fixed placeholder (unused in basket mode)."""
+    pc = cfg["product"]
+    return AutocallableNote(
+        notional=float(pc["notional"]),
+        spot=1.0,
+        maturity=float(pc["maturity"]),
+        observation_dates=pc["observation_dates"],
+        autocall_barriers=pc["autocall_barriers"],
+        coupon_rate=pc["coupon_rate"],
+        conditional_coupon=bool(pc.get("conditional_coupon", False)),
+        coupon_barrier=float(pc.get("coupon_barrier", 0.80)),
+        capital_barrier=float(pc.get("capital_barrier", 0.60)),
+        capital_barrier_active=bool(pc.get("capital_barrier_active", True)),
+        discount_rate=discount_rate,
+    )
+
+
 def build_product(cfg: dict, spot: float, rate: float) -> AutocallableNote:
     pc = cfg["product"]
     return AutocallableNote(
@@ -190,6 +284,15 @@ class GreekResult:
 
 
 @dataclass
+class BasketGreekResult:
+    """Per-asset finite-difference Greeks for one (scenario, model) pair."""
+    delta: dict[str, float]   # asset_name → ∂P/∂S_asset
+    gamma: dict[str, float]   # asset_name → ∂²P/∂S_asset²
+    vega:  dict[str, float]   # asset_name → ∂P/∂σ_asset · 0.01
+    vanna: dict[str, float]   # asset_name → ∂²P/(∂S_asset ∂σ_asset)
+
+
+@dataclass
 class ScenarioResult:
     name: str
     group: str
@@ -197,7 +300,8 @@ class ScenarioResult:
     prices: dict[str, float]       # model_name → price
     std_errors: dict[str, float]   # model_name → SE
     durations: Optional[dict[str, float]] = None       # model_name → expected duration (years)
-    greeks: Optional[dict[str, GreekResult]] = None   # model_name → GreekResult
+    greeks: Optional[dict[str, GreekResult]] = None   # model_name → GreekResult (single-asset)
+    basket_greeks: Optional[dict[str, BasketGreekResult]] = None  # model_name → BasketGreekResult
 
 
 # ── Greek computation ──────────────────────────────────────────────────────────
@@ -333,6 +437,148 @@ def compute_greeks(
     return greeks
 
 
+def compute_basket_greeks(
+    cfg: dict,
+    asset_surfaces: list[tuple[str, object]],
+    correlation: np.ndarray,
+    base_heston: dict[str, HestonParams],
+    product: AutocallableNote,
+    base_prices: dict[str, float],
+    seed: int,
+    antithetic: bool,
+    n_paths: int,
+    h_S_pct: float = 0.01,
+    h_v: float = 0.001,
+) -> dict[str, BasketGreekResult]:
+    """
+    Per-asset delta/gamma/vega/vanna via central finite differences: bump
+    ONE asset's spot/vol at a time, holding all other assets at base.
+    Cost: 8 bump points per asset (2 for delta/gamma, 2 for vega, 4 for
+    vanna cross terms) — 8N total for N assets, vs. the flat 8 in the
+    single-asset compute_greeks(). Only the bumped asset's Heston params are
+    recalibrated per vol bump (2N total recalibrations, not 2N × N).
+
+    Barrier convention — per-asset performance rescale, not barrier rescale
+    ------------------------------------------------------------------------
+    The single-asset compute_greeks() rescales the note's (shared, scalar)
+    barriers via _rescale_product_barriers() so a spot bump doesn't silently
+    change the ABSOLUTE dollar barrier level fixed at inception. A worst-of
+    barrier can't be rescaled the same way: it's ONE fraction shared across
+    whichever asset happens to be worst on a given date, not a per-asset
+    threshold, so there's nothing to rescale per-asset on the barrier side.
+
+    Instead, bumping asset i's ImpliedVolSurface.spot changes the reference
+    S_i(0) the model normalizes asset i's own performance against (S_i(t)/
+    S_i(0)_bumped). To keep the comparison against the ORIGINAL dollar
+    barrier level for asset i, that asset's per-asset performance is rescaled
+    by S_i(0)_bumped / S_i(0)_original BEFORE taking the worst-of min:
+        S_i(t)/S_i(0)_original = [S_i(t)/S_i(0)_bumped] * [S_i(0)_bumped/S_i(0)_original]
+    This is the exact mathematical equivalent of the single-asset barrier
+    rescale (same correction, applied to the performance side instead of the
+    barrier side, since only the performance side is asset-specific here).
+
+    This distinction matters most for Heston/SABR-style dynamics, whose SDEs
+    for S(t)/S(0) are scale-invariant (independent of the absolute spot
+    level) — without this rescale, a spot bump would leave the simulated
+    performance completely unchanged for those models, making delta/gamma
+    trivially zero rather than just noisy. Local Vol's dynamics DO depend on
+    the absolute spot level (the local vol surface is evaluated at absolute
+    S), so it gets a real (if small) contribution from both channels; the
+    rescale is applied uniformly to all models for consistency.
+    """
+    names = [n for n, _ in asset_surfaces]
+    surfaces = {n: s for n, s in asset_surfaces}
+    n_assets = len(names)
+    print(f"           ({8 * n_assets} bump evaluations for {n_assets} assets)")
+
+    delta = {m: {} for m in base_prices}
+    gamma = {m: {} for m in base_prices}
+    vega = {m: {} for m in base_prices}
+    vanna = {m: {} for m in base_prices}
+
+    def price_all(bumped_surfaces: dict[str, object],
+                  bumped_heston: dict[str, HestonParams],
+                  bumped_asset_name: str | None = None,
+                  scale_factor: float = 1.0) -> dict[str, float]:
+        """
+        Price under each basket model. If bumped_asset_name is given, that
+        asset's per-asset performance is rescaled by scale_factor before
+        taking the worst-of min (see docstring above); otherwise this is
+        just the ordinary aggregated basket price (used for pure vol bumps,
+        which don't touch any asset's spot reference and need no rescale).
+        """
+        ordered = [(n, bumped_surfaces[n]) for n in names]
+        pricers = build_basket_pricers(cfg, ordered, correlation, seed, antithetic,
+                                       heston_params=bumped_heston)
+        prices = {}
+        for pricer in pricers:
+            if bumped_asset_name is None:
+                perf = pricer.model.simulate(n_paths, product.observation_dates, antithetic=antithetic)
+            else:
+                per_asset = pricer.model.simulate_assets(n_paths, product.observation_dates,
+                                                         antithetic=antithetic)
+                a_idx = names.index(bumped_asset_name)
+                per_asset = per_asset.copy()
+                per_asset[:, :, a_idx] *= scale_factor
+                perf = per_asset.min(axis=2)
+            payoffs = product.evaluate_payoff(perf)
+            prices[pricer.model_name] = float(np.mean(payoffs))
+        return prices
+
+    for asset_name in names:
+        base_surf = surfaces[asset_name]
+        h_S = base_surf.spot * h_S_pct
+        scale_up = (base_surf.spot + h_S) / base_surf.spot
+        scale_dn = (base_surf.spot - h_S) / base_surf.spot
+
+        surf_up = {**surfaces, asset_name: base_surf.with_spot(base_surf.spot + h_S)}
+        surf_dn = {**surfaces, asset_name: base_surf.with_spot(base_surf.spot - h_S)}
+        P_up = price_all(surf_up, base_heston, asset_name, scale_up)
+        P_dn = price_all(surf_dn, base_heston, asset_name, scale_dn)
+
+        # Pure vol bump: no spot change, so no rescale needed.
+        surf_vup = {**surfaces, asset_name: base_surf.with_vol_shift(+h_v)}
+        surf_vdn = {**surfaces, asset_name: base_surf.with_vol_shift(-h_v)}
+        heston_vup = {**base_heston,
+                      asset_name: calibrate_heston(surf_vup[asset_name],
+                                                   initial_params=base_heston.get(asset_name),
+                                                   fast=True)}
+        heston_vdn = {**base_heston,
+                      asset_name: calibrate_heston(surf_vdn[asset_name],
+                                                   initial_params=base_heston.get(asset_name),
+                                                   fast=True)}
+        P_vup = price_all(surf_vup, heston_vup)
+        P_vdn = price_all(surf_vdn, heston_vdn)
+
+        # Vanna cross terms combine a vol shift with a spot bump -> rescale needed.
+        surf_up_vup = {**surfaces, asset_name: surf_vup[asset_name].with_spot(base_surf.spot + h_S)}
+        surf_dn_vup = {**surfaces, asset_name: surf_vup[asset_name].with_spot(base_surf.spot - h_S)}
+        surf_up_vdn = {**surfaces, asset_name: surf_vdn[asset_name].with_spot(base_surf.spot + h_S)}
+        surf_dn_vdn = {**surfaces, asset_name: surf_vdn[asset_name].with_spot(base_surf.spot - h_S)}
+        P_up_vup = price_all(surf_up_vup, heston_vup, asset_name, scale_up)
+        P_dn_vup = price_all(surf_dn_vup, heston_vup, asset_name, scale_dn)
+        P_up_vdn = price_all(surf_up_vdn, heston_vdn, asset_name, scale_up)
+        P_dn_vdn = price_all(surf_dn_vdn, heston_vdn, asset_name, scale_dn)
+
+        for model_name in base_prices:
+            P0 = base_prices[model_name]
+            delta[model_name][asset_name] = (P_up[model_name] - P_dn[model_name]) / (2.0 * h_S)
+            gamma[model_name][asset_name] = (P_up[model_name] - 2.0 * P0 + P_dn[model_name]) / (h_S ** 2)
+            vega[model_name][asset_name] = (P_vup[model_name] - P_vdn[model_name]) / (2.0 * h_v) * 0.01
+            vanna[model_name][asset_name] = (
+                P_up_vup[model_name] - P_dn_vup[model_name]
+                - P_up_vdn[model_name] + P_dn_vdn[model_name]
+            ) / (4.0 * h_S * h_v)
+
+    return {
+        model_name: BasketGreekResult(
+            delta=delta[model_name], gamma=gamma[model_name],
+            vega=vega[model_name], vanna=vanna[model_name],
+        )
+        for model_name in base_prices
+    }
+
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 def run_all(
@@ -366,53 +612,95 @@ def run_all(
         overrides = scenario.get("overrides", {})
 
         cfg = deep_merge(base_cfg, overrides)
-
-        mc = cfg["market"]
-        SPOT = float(mc["spot"])
-        RATE = float(mc["rate"])
-        DIV_YIELD = float(mc["div_yield"])
+        is_basket = "assets" in cfg
 
         print(f"\n[{idx+1:2d}/{len(spec['scenarios'])}] {group.upper():7s} | {name}")
         if verbose:
             print(f"         {description[:80]}")
 
-        surface = build_surface(cfg, SPOT, RATE, DIV_YIELD)
-
-        # Calibrate SV models once; reuse params for spot-bump Greeks
-        base_cal = calibrate_all(cfg, surface, verbose=verbose)
-
-        pricers = build_pricers(cfg, surface, SPOT, RATE, DIV_YIELD,
-                                seed, antithetic, calibrated_params=base_cal)
-        product = build_product(cfg, SPOT, RATE)
-
-        prices, ses, durations = {}, {}, {}
-        for pricer in pricers:
-            result = pricer.price(product, n_paths)
-            prices[pricer.model_name] = result.price
-            ses[pricer.model_name] = result.std_error
-            durations[pricer.model_name] = result.expected_duration
-            print(f"           {pricer.model_name:12s}  {result.price:.6f}  ±{result.std_error:.6f}"
-                  f"  dur={result.expected_duration:.2f}y")
-
         greeks = None
-        if compute_greeks_flag:
-            print(f"           Computing Greeks  (N={n_greek_paths:,}, "
-                  f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp) ...")
-            greeks = compute_greeks(
-                cfg, surface, base_cal, product, prices,
-                SPOT, RATE, DIV_YIELD, seed, antithetic, n_greek_paths,
-                h_S_pct=h_S_pct, h_v=h_v,
-            )
-            for model_name, gr in greeks.items():
-                print(f"             {model_name:12s}"
-                      f"  Δ={gr.delta:+.6f}"
-                      f"  Γ={gr.gamma:+.6f}"
-                      f"  ν={gr.vega:+.6f}"
-                      f"  vanna={gr.vanna:+.6f}")
+        basket_greeks = None
+
+        if is_basket:
+            asset_surfaces = build_basket_surfaces(cfg)
+            correlation = load_correlation(cfg, len(asset_surfaces))
+            rates = {s.rate for _, s in asset_surfaces}
+            assert len(rates) == 1, "all basket assets must share the same discount rate (v1 constraint)"
+            RATE = rates.pop()
+
+            base_heston = calibrate_basket_heston(asset_surfaces, verbose=verbose)
+            pricers = build_basket_pricers(cfg, asset_surfaces, correlation, seed, antithetic,
+                                           heston_params=base_heston)
+            product = build_basket_product(cfg, RATE)
+
+            prices, ses, durations = {}, {}, {}
+            for pricer in pricers:
+                result = pricer.price(product, n_paths)
+                prices[pricer.model_name] = result.price
+                ses[pricer.model_name] = result.std_error
+                durations[pricer.model_name] = result.expected_duration
+                print(f"           {pricer.model_name:12s}  {result.price:.6f}  ±{result.std_error:.6f}"
+                      f"  dur={result.expected_duration:.2f}y")
+
+            if compute_greeks_flag:
+                print(f"           Computing basket Greeks  (N={n_greek_paths:,}, "
+                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp) ...")
+                basket_greeks = compute_basket_greeks(
+                    cfg, asset_surfaces, correlation, base_heston, product, prices,
+                    seed, antithetic, n_greek_paths, h_S_pct=h_S_pct, h_v=h_v,
+                )
+                for model_name, gr in basket_greeks.items():
+                    print(f"             {model_name}:")
+                    for asset_name in gr.delta:
+                        print(f"               {asset_name:12s}"
+                              f"  Δ={gr.delta[asset_name]:+.6f}"
+                              f"  Γ={gr.gamma[asset_name]:+.6f}"
+                              f"  ν={gr.vega[asset_name]:+.6f}"
+                              f"  vanna={gr.vanna[asset_name]:+.6f}")
+
+        else:
+            mc = cfg["market"]
+            SPOT = float(mc["spot"])
+            RATE = float(mc["rate"])
+            DIV_YIELD = float(mc["div_yield"])
+
+            surface = build_surface(cfg, SPOT, RATE, DIV_YIELD)
+
+            # Calibrate SV models once; reuse params for spot-bump Greeks
+            base_cal = calibrate_all(cfg, surface, verbose=verbose)
+
+            pricers = build_pricers(cfg, surface, SPOT, RATE, DIV_YIELD,
+                                    seed, antithetic, calibrated_params=base_cal)
+            product = build_product(cfg, SPOT, RATE)
+
+            prices, ses, durations = {}, {}, {}
+            for pricer in pricers:
+                result = pricer.price(product, n_paths)
+                prices[pricer.model_name] = result.price
+                ses[pricer.model_name] = result.std_error
+                durations[pricer.model_name] = result.expected_duration
+                print(f"           {pricer.model_name:12s}  {result.price:.6f}  ±{result.std_error:.6f}"
+                      f"  dur={result.expected_duration:.2f}y")
+
+            if compute_greeks_flag:
+                print(f"           Computing Greeks  (N={n_greek_paths:,}, "
+                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp) ...")
+                greeks = compute_greeks(
+                    cfg, surface, base_cal, product, prices,
+                    SPOT, RATE, DIV_YIELD, seed, antithetic, n_greek_paths,
+                    h_S_pct=h_S_pct, h_v=h_v,
+                )
+                for model_name, gr in greeks.items():
+                    print(f"             {model_name:12s}"
+                          f"  Δ={gr.delta:+.6f}"
+                          f"  Γ={gr.gamma:+.6f}"
+                          f"  ν={gr.vega:+.6f}"
+                          f"  vanna={gr.vanna:+.6f}")
 
         results.append(ScenarioResult(
             name=name, group=group, description=description,
-            prices=prices, std_errors=ses, durations=durations, greeks=greeks,
+            prices=prices, std_errors=ses, durations=durations,
+            greeks=greeks, basket_greeks=basket_greeks,
         ))
 
     return results
@@ -500,6 +788,30 @@ def print_summary(results: list[ScenarioResult]) -> None:
             print(row)
         print()
 
+    print_basket_greeks_summary(results)
+
+
+def print_basket_greeks_summary(results: list[ScenarioResult]) -> None:
+    """Per-asset Greeks for basket scenarios (see compute_basket_greeks)."""
+    results_bg = [r for r in results if r.basket_greeks]
+    if not results_bg:
+        return
+
+    print("=" * 70)
+    print("  Basket Greeks (per asset)")
+    print("=" * 70)
+    for r in results_bg:
+        print(f"\n  {r.name} ({r.group})")
+        for model_name, gr in r.basket_greeks.items():
+            print(f"    {model_name}:")
+            for asset_name in gr.delta:
+                print(f"      {asset_name:12s}"
+                      f"  Δ={gr.delta[asset_name]:+.6f}"
+                      f"  Γ={gr.gamma[asset_name]:+.6f}"
+                      f"  ν={gr.vega[asset_name]:+.6f}"
+                      f"  vanna={gr.vanna[asset_name]:+.6f}")
+    print()
+
 
 def save_csv(results: list[ScenarioResult], path: str) -> None:
     if not results:
@@ -507,7 +819,20 @@ def save_csv(results: list[ScenarioResult], path: str) -> None:
     model_names = list(results[0].prices.keys())
     has_durations = any(r.durations for r in results)
     has_greeks = any(r.greeks for r in results)
+    has_basket_greeks = any(r.basket_greeks for r in results)
     greek_attrs = ["delta", "gamma", "vega", "vanna"]
+
+    # Union of (model_name, asset_name) pairs seen across basket scenarios,
+    # in first-seen order -- columns are the same for every row.
+    basket_keys: list[tuple[str, str]] = []
+    if has_basket_greeks:
+        for r in results:
+            if r.basket_greeks:
+                for model_name, gr in r.basket_greeks.items():
+                    for asset_name in gr.delta:
+                        key = (model_name, asset_name)
+                        if key not in basket_keys:
+                            basket_keys.append(key)
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -520,6 +845,10 @@ def save_csv(results: list[ScenarioResult], path: str) -> None:
         if has_greeks:
             for attr in greek_attrs:
                 header += [f"{n}_{attr}" for n in model_names]
+        if has_basket_greeks:
+            for model_name, asset_name in basket_keys:
+                for attr in greek_attrs:
+                    header += [f"{model_name}_{asset_name}_{attr}"]
         writer.writerow(header)
 
         for r in results:
@@ -538,6 +867,17 @@ def save_csv(results: list[ScenarioResult], path: str) -> None:
                         row += [getattr(r.greeks[n], attr) for n in model_names]
                 else:
                     row += [""] * (len(greek_attrs) * len(model_names))
+            if has_basket_greeks:
+                if r.basket_greeks:
+                    for model_name, asset_name in basket_keys:
+                        gr = r.basket_greeks.get(model_name)
+                        if gr and asset_name in gr.delta:
+                            for attr in greek_attrs:
+                                row.append(getattr(gr, attr)[asset_name])
+                        else:
+                            row += [""] * len(greek_attrs)
+                else:
+                    row += [""] * (len(greek_attrs) * len(basket_keys))
             writer.writerow(row)
 
     print(f"Results saved → {path}")
