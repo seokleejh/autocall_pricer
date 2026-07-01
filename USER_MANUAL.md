@@ -12,6 +12,8 @@
    - [product](#44-product)
    - [models](#45-models)
 5. [Running a Single Pricing](#5-running-a-single-pricing)
+   - [Fit check modes](#51-fit-check-modes)
+   - [Calibration diagnostics](#52-calibration-diagnostics)
 6. [Scenario Analysis](#6-scenario-analysis)
    - [Basic run](#61-basic-run)
    - [Computing Greeks](#62-computing-greeks)
@@ -36,10 +38,18 @@ solely from the choice of dynamics — as a measure of model risk.
 |-------|----------|-------------|-------------|
 | **Local Vol** (Dupire) | Deterministic σ(t, S) derived from market vols via Dupire's formula | Exact by construction | Model risk lower bound; conservative barrier pricing |
 | **Heston SV** | Mean-reverting stochastic variance (CIR process); spot-vol correlation ρ | Global fit over all maturities and strikes | Captures forward skew dynamics; well-suited for long-dated autocalls |
-| **SABR SV** | Log-normal stochastic vol; backbone β = 1 | Calibrated to a single maturity slice (default: 1y) | Rich short-dated smile; may extrapolate poorly to maturities far from calibration |
+| **SABR SV** | Log-normal stochastic vol; backbone β = 1 | Calibrated to a single maturity slice (default: 1y) | **Disabled by default.** See note below. |
 
 All three are calibrated to the same implied vol surface, so differences in price are not due to a vol
 level mismatch — they reflect genuine disagreement about the joint distribution of path and final payoff.
+
+> **Why SABR is disabled by default**: SABR's single `alpha` parameter produces a nearly flat ATM
+> vol term structure, but equity surfaces have an exponential ATM decay (high short-term vol
+> converging to a lower long-run level). On any realistic term-structure surface, SABR will
+> systematically underprice vol at short maturities (≥150 bp at 0.5y is typical) and overprice
+> it at long maturities, leading to mispriced barrier crossing probabilities at each observation
+> date. SABR was designed for single-maturity vanilla books, not for multi-date path-dependent
+> payoffs. Enable it with `sabr: true` in `config.yaml` for research or model comparison only.
 
 ### Two entry points
 
@@ -53,6 +63,9 @@ level mismatch — they reflect genuine disagreement about the joint distributio
 ## 2. Setup
 
 **Prerequisites:** Python 3.10+, a Unix-like shell (Linux, macOS, WSL).
+
+On native Windows (no WSL), see [WINDOWS_SETUP.md](WINDOWS_SETUP.md) instead —
+same steps, adapted for PowerShell/CMD.
 
 ```bash
 # 1. Clone / enter the project directory
@@ -270,13 +283,14 @@ capital only if the stock finishes more than 40% below its initial level).
 
 ```yaml
 models:
-  local_vol: true
-  heston:    true
-  sabr:      true
+  local_vol: true   # recommended
+  heston:    true   # recommended
+  sabr:      false  # disabled by default — see Section 1 for rationale
 ```
 
 Set any to `false` to skip that model. Running with only one model is faster and useful for
-sensitivity testing.
+sensitivity testing. SABR can be re-enabled for research or comparison runs, but its prices
+should not be used for production autocallable risk management.
 
 ---
 
@@ -286,20 +300,116 @@ sensitivity testing.
 python main.py [--config FILE] [--no-fit-check | --full-diagnostic]
 ```
 
-**Default** (`python main.py`): calibrates Heston and SABR, runs a fast analytical vol fit check,
-then prices the note under all enabled models.
+### 5.1 Fit check modes
 
-**`--no-fit-check`**: skip the fit quality table and go straight to pricing. Useful in scripts.
+Three levels of calibration quality check are available:
 
-**`--full-diagnostic`**: run a Monte Carlo vol surface diagnostic via `diagnostics/model_quality.py`
-before pricing. This simulates each model at a grid of maturities and strikes and recovers implied
-vols from MC prices, then plots them against the market surface. Useful for verifying calibration
-quality with a realistic number of paths.
+| Flag | Speed | Method | Use case |
+|------|-------|--------|----------|
+| *(default)* | ~1s | Analytical (Heston CF, SABR Hagan) | Daily use — quick sanity check |
+| `--no-fit-check` | 0s | None | Scripted runs where you trust the config |
+| `--full-diagnostic` | ~2–5 min | Monte Carlo smile recovery | Before pricing a new deal structure |
+
+The **default analytical check** evaluates model-implied vols at a small (T, K) grid using closed
+forms — the Heston characteristic function for Heston and the Hagan asymptotic formula for SABR —
+and reports RMSE and worst-case error in basis points. Local Vol always fits exactly by construction.
+
+```
+Vol Surface Fit — Analytical Check
+  Local Vol   exact fit (by construction)
+  Heston  RMSE:  12.3bp  max:  +28.4bp  (T=0.5y, K/S=70%)
+  SABR    RMSE:   8.1bp  max:  -19.2bp  (T=3.0y, K/S=130%)
+```
+
+This tells you whether calibration converged well, but it uses the same formula as the calibration
+objective — it cannot detect systematic model mis-specification. Use `--full-diagnostic` for that.
+
+### 5.2 Calibration diagnostics
+
+`diagnostics/model_quality.py` is the heavy-duty check. It prices OTM vanilla options using full
+Monte Carlo paths, inverts to implied vols, and compares against the input surface. This tests
+whether the model dynamics actually reproduce the input smile in-sample, not just whether the
+calibration objective converged.
 
 ```bash
+# Run standalone (uses config.yaml by default)
+python diagnostics/model_quality.py
+
+# Custom config, more paths, save plot to a specific location
+python diagnostics/model_quality.py \
+    --config my_deal.yaml \
+    --n-paths 50000 \
+    --output results/fit_check.png
+
+# Trigger from main.py (calibrates models once, then runs the diagnostic)
 python main.py --full-diagnostic
-python diagnostics/model_quality.py --n-paths 50000 --output fit_check.png
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `config.yaml` | Config file (market, surface, models) |
+| `--n-paths` | 30,000 | MC paths per (model, maturity) pair |
+| `--output` | `diagnostics/vol_surface_fit.png` | PNG plot output path |
+
+#### What it evaluates
+
+The diagnostic uses a fixed grid regardless of your product structure:
+
+- **Maturities**: 0.1y, 0.2y, 0.3y, 0.5y (short-end of the surface where calibration is hardest)
+- **Strikes**: 70% to 130% of spot in 13 steps (moneyness grid)
+- **OTM convention**: puts for K < spot, calls for K ≥ spot — avoids inverting deep-ITM options
+  where vega is negligible and MC noise dominates the implied vol estimate
+
+For each (model, maturity) pair:
+1. Simulate `n_paths` paths to that maturity (paths are reused across all strikes — no extra simulation per strike)
+2. Evaluate OTM payoffs for each strike
+3. Invert to implied vol via Black-Scholes
+
+#### Reading the table output
+
+```
+T = 0.3y
+K/S0    Input IV   Local Vol          Heston             SABR
+                    IV   Err(bp)       IV   Err(bp)       IV   Err(bp)
+--------------------------------------------------------------------
+  0.70   28.15%   28.12%    -3.2     27.44%   -70.8     27.91%   -24.3
+  0.80   24.10%   24.08%    -2.1     23.81%   -29.4     24.01%    -9.1
+  0.90   20.88%   20.87%    -1.2     20.74%   -13.5     20.86%    -1.9
+  1.00   18.32%   18.31%    -0.9     18.28%    -4.1     18.30%    -1.8
+  1.10   17.21%   17.20%    -0.8     17.26%    +5.2     17.19%    -1.5
+  1.20   17.54%   17.52%    -1.6     17.68%   +14.1     17.51%    -3.1
+  1.30   18.78%   18.76%    -1.9     18.99%   +20.8     18.74%    -3.8
+```
+
+- **Input IV**: the market surface value (ground truth)
+- **IV**: model MC-implied vol (with MC noise)
+- **Err(bp)**: model − market in basis points. Positive = model overprices vol at that strike.
+
+**Interpreting errors by model:**
+
+| Model | Expected behaviour | Warning sign |
+|---|---|---|
+| Local Vol | Near-zero errors everywhere (by construction) | Errors > 5 bp indicate spline interpolation artifacts or paths near the grid boundary |
+| Heston | Errors grow at very short maturities and deep strikes (one-factor SV limits) | RMSE > 30 bp at T ≤ 0.3y means the model will misprice early-date barriers |
+| SABR | Calibrated at 1y; may have larger errors at 0.1–0.3y and at very deep OTM | Errors > 50 bp at T < 0.3y are expected; errors > 50 bp at T = 0.5y near ATM deserve attention |
+
+#### The smile plot
+
+The PNG shows one subplot per maturity, each with:
+- **Black solid line**: input surface (market)
+- **Dashed / dash-dot / dotted lines**: Local Vol, Heston, SABR model-implied vols
+
+A well-calibrated model's line should closely track the black line. Systematic bowing (model curves
+above or below the market across all strikes at a given maturity) usually means the ATM vol level
+is off. Crossing lines (model fits OTM puts but not OTM calls, or vice versa) usually means the
+skew is wrong.
+
+#### When to re-run before pricing
+
+- Whenever you change `vol_surface` parameters in the config
+- If Heston or SABR calibration printed warnings during `main.py`
+- Before pricing a new product with barriers significantly different from ATM (deep OTM/ITM
+  paths are where model errors matter most)
 
 ### Reading the output
 

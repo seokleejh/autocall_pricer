@@ -1,0 +1,93 @@
+# =============================================================================
+# Scenario definitions for autocallable model comparison.
+#
+# Each scenario specifies only what changes from the base config (config.yaml).
+# All other parameters are inherited unchanged.
+#
+# Two groups:
+#   market  — vary the vol surface; product structure is fixed
+#   product — vary the product structure; vol surface is fixed (base case)
+#
+# Spread (bp) = (max model price − min model price) × 10,000
+# A large spread signals high model risk for that scenario.
+#
+# Fixed product as std fcn
+# =============================================================================
+
+base_config: configs/config_std_fcn.yaml   # Path to base config (relative to project root)
+
+scenarios:
+
+  # ── Group 1: Market scenarios ───────────────────────────────────────────────
+  # Hold the product structure fixed and vary the vol surface.
+  # Tests: does a steeper skew / higher vol / different term structure
+  # widen or narrow the gap between Local Vol, Heston, and SABR?
+
+  - name: Base case
+    group: market
+    description: >
+      Benchmark.
+
+  - name: High vol
+    group: market
+    description: >
+      Both short and long vol raised by +5%. Models must work harder to
+      fit the higher level; stochastic-vol models may diverge more.
+    overrides:
+      vol_surface:
+        vol_short: 0.45
+        vol_long: 0.30
+
+  - name: Extreme vol
+    group: market
+    description: >
+      Both short and long vol raised by +20%. Models must work harder to
+      fit the higher level; stochastic-vol models may diverge more.
+    overrides:
+      vol_surface:
+        vol_short: 0.65
+        vol_long: 0.45
+
+  - name: Low vol
+    group: market
+    description: >
+      Calm market: vol_short=18%, vol_long=14%. Skew effects are smaller
+      in absolute terms; model spread expected to compress.
+    overrides:
+      vol_surface:
+        vol_short: 0.18
+        vol_long: 0.14
+
+  - name: Steep skew
+    group: market
+    description: >
+      Skew doubled to -0.20 at 1y (effective -0.28 at 6m). Represents
+      a stressed or post-crash environment with large put premium.
+      Model disagreement on skew dynamics should widen the spread.
+    overrides:
+      vol_surface:
+        skew: -0.20
+
+  - name: Flat skew
+    group: market
+    description: >
+      Near-zero skew (-0.03) and no convexity. All models should converge
+      as the surface approaches a flat smile. Useful as a lower-bound
+      reference for model spread.
+    overrides:
+      vol_surface:
+        skew: -0.03
+        convexity: 0.00
+
+  - name: Inverted term structure
+    group: market
+    description: >
+      Short-term vol (15%) is BELOW long-term vol (25%) — contango vol term
+      structure as seen in low-volatility regimes with rising uncertainty.
+      Tests whether models handle an upward-sloping ATM curve differently.
+    overrides:
+      vol_surface:
+        vol_short: 0.15
+        vol_long: 0.25
+        kappa: 1.0
+

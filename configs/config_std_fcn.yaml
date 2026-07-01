@@ -1,6 +1,12 @@
 # =============================================================================
 # Autocallable Pricer — Configuration File
-#
+# Configuration for Standard FCN
+# Tenor 6 / 12
+# KO Freq 1 / 12
+# KO Barrier 1.00
+# Strike = Participation = 1.00
+# Monthly CPN 9% p.a. no condition
+# EKI 0.7
 # All rates and vols are expressed as decimals (0.20 = 20%).
 # All barriers and coupons are expressed as fractions of notional or spot.
 # All times are in years.
@@ -62,11 +68,11 @@ vol_surface:
   # This gives an exponential interpolation from vol_short (at T→0)
   # to vol_long (at T→∞), with kappa controlling the speed of convergence.
   #
-  vol_short: 0.25   # ATM implied vol as T → 0 (very short maturities).
+  vol_short: 0.40   # ATM implied vol as T → 0 (very short maturities).
                     # Typically higher than vol_long due to short-term event risk
                     # (earnings, macro announcements). Example: 0.25 = 25%.
 
-  vol_long: 0.18    # ATM implied vol as T → ∞ (long-run equilibrium level).
+  vol_long: 0.25    # ATM implied vol as T → ∞ (long-run equilibrium level).
                     # Represents the market's expectation of long-run realised vol.
                     # Example: 0.18 = 18%.
 
@@ -131,13 +137,13 @@ product:
                     # notional, so 1.0 (= 100%) is the standard choice.
                     # A price of 1.05 means the note is worth 105% of face value.
 
-  maturity: 3.0     # Final maturity of the note in years.
+  maturity: 0.5     # Final maturity of the note in years.
                     # The last entry in observation_dates must equal this value.
 
   # Observation dates (years): the dates at which the autocall condition is checked.
   # Must be strictly increasing and end exactly at maturity.
   # Example below: semi-annual observations over 3 years.
-  observation_dates: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  observation_dates: [0.0833333, 0.166667, 0.25, 0.333333, 0.4166667, 0.5]
 
   # --- Autocall barriers ---
   # The note autocalls (terminates early) on observation date t_i if:
@@ -150,7 +156,7 @@ product:
   #
   # Example below (step-down): note autocalls at 80% of initial spot for the
   # first two observations, then steps down to 60% by maturity.
-  autocall_barriers: [0.80, 0.80, 0.75, 0.70, 0.65, 0.60]
+  autocall_barriers: 1.00
 
   # --- Coupon on autocall ---
   # Cash amount paid to the investor when the note autocalls, as a fraction of notional.
@@ -163,7 +169,7 @@ product:
   #     autocall at 0.5y → investor receives 7%  of notional
   #     autocall at 1.0y → investor receives 14% of notional (= 2 × 7%)
   #     autocall at 1.5y → investor receives 21% of notional (= 3 × 7%)  ...etc.
-  coupon_rate: [0.07, 0.14, 0.21, 0.28, 0.35, 0.42]
+  coupon_rate: 0.0075
 
   # --- Phoenix structure (conditional periodic coupon) ---
   # When conditional_coupon = true, a coupon is paid at each observation date
@@ -173,9 +179,9 @@ product:
   #
   # conditional_coupon = false → Standard autocall (coupon only on autocall).
   # conditional_coupon = true  → Phoenix autocall  (periodic coupon if above barrier).
-  conditional_coupon: false
+  conditional_coupon: true
 
-  coupon_barrier: 0.80  # Performance threshold for Phoenix coupon payments.
+  coupon_barrier: 0.00  # Performance threshold for Phoenix coupon payments.
                         # Only used when conditional_coupon = true.
                         # At each observation: if S(t_i)/spot ≥ coupon_barrier,
                         # investor receives coupon_rate[i] × notional.
@@ -194,7 +200,7 @@ product:
   #
   capital_barrier_active: true
 
-  capital_barrier: 0.60  # Knock-in level as a fraction of initial spot.
+  capital_barrier: 0.70  # Knock-in level as a fraction of initial spot.
                           # Example: 0.60 = investor loses capital only if the
                           # stock finishes more than 40% below its initial level.
 

@@ -113,52 +113,87 @@ def calibrate_sabr(
     """
     Calibrate SABR (alpha, rho, nu) for fixed beta to the implied vol surface.
 
-    SABR is typically calibrated slice-by-slice per maturity.
-    Here we calibrate to the median maturity slice by default.
+    Two-step procedure that separates smile shape from ATM level:
+
+    Step 1 — Fit (rho, nu) from the smile SHAPE at a single reference slice.
+        rho and nu drive the skew slope and curvature; they are largely
+        maturity-independent and are well-identified from a single cross-section.
+
+    Step 2 — Refit alpha across the full ATM term structure with (rho, nu) fixed.
+        SABR with a single alpha cannot exactly match an exponential ATM term
+        structure, so this step finds the minimum-MSE alpha across all maturities.
+        This removes the systematic bias from calibrating to only one maturity.
 
     Parameters
     ----------
     beta : float
         Fixed CEV exponent. Default 1.0 (lognormal backbone).
     calibration_maturity : float | None
-        Maturity slice to calibrate to. Defaults to median maturity.
+        Maturity slice for Step 1 (smile shape). Defaults to a point roughly
+        one-third into the surface — short enough to capture the steeper
+        near-term skew while remaining reliable for the Hagan formula.
     n_strikes : int
-        Number of strike points to use from that maturity slice.
+        Number of strike points used in the Step 1 smile fit.
     """
     T_min, T_max = surface.maturity_range
-    T_cal = calibration_maturity or 0.5 * (T_min + T_max)
-    T_cal = float(np.clip(T_cal, T_min, T_max))
 
-    F = float(surface.forward(T_cal))
+    # Step 1 reference slice: default to one-third of the surface tenor, but
+    # never below T_min or above T_max.  A shorter reference better identifies
+    # rho from the steeper near-term skew.
+    if calibration_maturity is not None:
+        T_ref = float(np.clip(calibration_maturity, T_min, T_max))
+    else:
+        T_ref = float(np.clip((T_min + T_max) / 3.0, T_min, T_max))
+
+    F_ref = float(surface.forward(T_ref))
+    atm_vol_ref = float(surface.implied_vol(T_ref, F_ref))
 
     # Restrict to near-ATM strikes where the Hagan formula is reliable
-    K_cal = np.linspace(F * 0.80, F * 1.20, n_strikes)
-    target_vols = np.array([surface.implied_vol(float(T_cal), float(k)) for k in K_cal])
+    K_cal = np.linspace(F_ref * 0.80, F_ref * 1.20, n_strikes)
+    target_vols = np.array([float(surface.implied_vol(T_ref, float(k))) for k in K_cal])
 
-    def sabr_vol(alpha, rho, nu, K):
-        from models.sabr import SABRParams
+    def _hagan(alpha, rho, nu, K):
         p = SABRParams(alpha=alpha, beta=beta, rho=rho, nu=nu)
-        v = p.hagan_implied_vol(F, K, T_cal)
-        return max(v, 1e-6)
+        return max(p.hagan_implied_vol(F_ref, float(K), T_ref), 1e-6)
 
-    atm_vol = float(surface.implied_vol(float(T_cal), float(F)))
-    x0 = [atm_vol, -0.3, 0.4]  # alpha, rho, nu
-
+    # ── Step 1: calibrate all three params at the reference slice ─────────────
+    x0 = [atm_vol_ref, -0.3, 0.4]
     bounds = Bounds(lb=[1e-4, -0.999, 1e-4], ub=[5.0, 0.999, 10.0])
 
-    def objective(x):
+    def objective_slice(x):
         alpha, rho, nu = x
         errors = []
         for K, tv in zip(K_cal, target_vols):
             try:
-                mv = sabr_vol(alpha, rho, nu, K)
+                mv = _hagan(alpha, rho, nu, K)
             except Exception:
-                mv = atm_vol
+                mv = atm_vol_ref
             errors.append((mv - tv) ** 2)
         return np.mean(errors)
 
-    res = minimize(objective, x0, method="L-BFGS-B", bounds=bounds,
-                   options={"maxiter": 300, "ftol": 1e-10})
+    res1 = minimize(objective_slice, x0, method="L-BFGS-B", bounds=bounds,
+                    options={"maxiter": 300, "ftol": 1e-10})
+    alpha_ref, rho, nu = res1.x
 
-    alpha, rho, nu = res.x
+    # ── Step 2: refit alpha across the full ATM term structure ────────────────
+    # Use a dense grid of maturities so alpha is pulled toward the best
+    # compromise across all maturities, not just the reference slice.
+    n_T_atm = 12
+    T_atm_grid = np.linspace(max(T_min, 0.25), T_max, n_T_atm)
+    F_atm_grid = np.array([float(surface.forward(T)) for T in T_atm_grid])
+    mkt_atm_grid = np.array([float(surface.implied_vol(T, F))
+                              for T, F in zip(T_atm_grid, F_atm_grid)])
+
+    def objective_alpha(x):
+        alpha = x[0]
+        p = SABRParams(alpha=alpha, beta=beta, rho=rho, nu=nu)
+        errors = [(max(p.hagan_implied_vol(F, F, T), 1e-6) - mkt_atm) ** 2
+                  for T, F, mkt_atm in zip(T_atm_grid, F_atm_grid, mkt_atm_grid)]
+        return np.mean(errors)
+
+    res2 = minimize(objective_alpha, [alpha_ref], method="L-BFGS-B",
+                    bounds=Bounds(lb=[1e-4], ub=[5.0]),
+                    options={"maxiter": 200, "ftol": 1e-12})
+    alpha = float(res2.x[0])
+
     return SABRParams(alpha=alpha, beta=beta, rho=rho, nu=nu)
