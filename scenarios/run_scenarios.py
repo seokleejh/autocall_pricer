@@ -277,19 +277,21 @@ def build_product(cfg: dict, spot: float, rate: float) -> AutocallableNote:
 @dataclass
 class GreekResult:
     """Finite-difference Greeks for one (scenario, model) pair."""
-    delta: float   # ∂P/∂S
-    gamma: float   # ∂²P/∂S²
-    vega:  float   # ∂P/∂σ · 0.01  (per 1 percentage-point parallel vol shift)
-    vanna: float   # ∂²P / (∂S ∂σ)
+    delta: float      # ∂P/∂S
+    gamma: float      # ∂²P/∂S²
+    vega:  float      # ∂P/∂σ · 0.01  (per 1 percentage-point parallel vol shift)
+    vanna: float      # ∂²P / (∂S ∂σ)
+    skew_sens: float  # ∂P/∂skew · 0.01 (per 0.01 shift in the skew coefficient; see with_skew_shift)
 
 
 @dataclass
 class BasketGreekResult:
     """Per-asset finite-difference Greeks for one (scenario, model) pair."""
-    delta: dict[str, float]   # asset_name → ∂P/∂S_asset
-    gamma: dict[str, float]   # asset_name → ∂²P/∂S_asset²
-    vega:  dict[str, float]   # asset_name → ∂P/∂σ_asset · 0.01
-    vanna: dict[str, float]   # asset_name → ∂²P/(∂S_asset ∂σ_asset)
+    delta: dict[str, float]       # asset_name → ∂P/∂S_asset
+    gamma: dict[str, float]       # asset_name → ∂²P/∂S_asset²
+    vega:  dict[str, float]       # asset_name → ∂P/∂σ_asset · 0.01
+    vanna: dict[str, float]       # asset_name → ∂²P/(∂S_asset ∂σ_asset)
+    skew_sens: dict[str, float]   # asset_name → ∂P/∂skew_asset · 0.01
 
 
 @dataclass
@@ -358,9 +360,10 @@ def compute_greeks(
     n_paths: int,
     h_S_pct: float = 0.01,
     h_v: float = 0.001,
+    h_skew: float = 0.01,
 ) -> dict[str, GreekResult]:
     """
-    Compute delta, gamma, vega, vanna via central finite differences.
+    Compute delta, gamma, vega, vanna, skew_sens via central finite differences.
 
     Delta convention
     ----------------
@@ -376,16 +379,26 @@ def compute_greeks(
     fast warm-start (relaxed tolerance) to keep runtime manageable.
     LocalVol reads the shifted surface directly — no calibration needed.
 
+    Skew bump
+    ---------
+    skew_sens uses ImpliedVolSurface.with_skew_shift(), a maturity-dependent
+    tilt (zero at each maturity's own ATM point, decaying as 1/sqrt(T) to
+    match term_structure_surface's own `skew` parameter convention) rather
+    than a flat shift — so it isolates the smile SLOPE from the level (vega)
+    already captured above. Re-calibrated the same way as the vega bumps.
+
     Variance reduction
     ------------------
-    All 8 bumped evaluations use the same RNG seed (common random numbers),
+    All bumped evaluations use the same RNG seed (common random numbers),
     so noise in the FD numerators largely cancels.
 
     Parameters
     ----------
     h_S_pct : spot bump as a fraction of spot (default 0.01 = 1 %)
     h_v     : absolute parallel implied-vol shift (default 0.001 = 10 bp)
+    h_skew  : skew-coefficient bump for with_skew_shift (default 0.01)
     vega    : reported per 1 percentage-point (0.01) parallel vol shift
+    skew_sens : reported per 0.01 shift in the skew coefficient
     """
     h_S = SPOT * h_S_pct
 
@@ -393,32 +406,38 @@ def compute_greeks(
     product_up = _rescale_product_barriers(product, SPOT, SPOT + h_S)
     product_dn = _rescale_product_barriers(product, SPOT, SPOT - h_S)
 
-    # ── 8 bumped surfaces ──────────────────────────────────────────────────────
+    # ── bumped surfaces ─────────────────────────────────────────────────────────
     s_up     = base_surface.with_spot(SPOT + h_S)
     s_dn     = base_surface.with_spot(SPOT - h_S)
     s_vup    = base_surface.with_vol_shift(+h_v)
     s_vdn    = base_surface.with_vol_shift(-h_v)
+    s_skup   = base_surface.with_skew_shift(+h_skew)
+    s_skdn   = base_surface.with_skew_shift(-h_skew)
     # Cross terms for vanna: vol shift first, then spot shift
     s_up_vup = s_vup.with_spot(SPOT + h_S)
     s_dn_vup = s_vup.with_spot(SPOT - h_S)
     s_up_vdn = s_vdn.with_spot(SPOT + h_S)
     s_dn_vdn = s_vdn.with_spot(SPOT - h_S)
 
-    # Re-calibrate SV models for vol-bumped surfaces (fast warm-start).
-    cal_vup = calibrate_all(cfg, s_vup, fast=True, warm_start=base_cal)
-    cal_vdn = calibrate_all(cfg, s_vdn, fast=True, warm_start=base_cal)
+    # Re-calibrate SV models for vol- and skew-bumped surfaces (fast warm-start).
+    cal_vup  = calibrate_all(cfg, s_vup,  fast=True, warm_start=base_cal)
+    cal_vdn  = calibrate_all(cfg, s_vdn,  fast=True, warm_start=base_cal)
+    cal_skup = calibrate_all(cfg, s_skup, fast=True, warm_start=base_cal)
+    cal_skdn = calibrate_all(cfg, s_skdn, fast=True, warm_start=base_cal)
 
     def price_all(surface, spot, cal, prod) -> dict[str, float]:
         pricers = build_pricers(cfg, surface, spot, RATE, DIV_YIELD,
                                 seed, antithetic, calibrated_params=cal)
         return {p.model_name: p.price(prod, n_paths).price for p in pricers}
 
-    # 8 bumped price evaluations (CRN via shared seed)
-    # Spot-bumped calls use rescaled products; vol-only calls use the original.
+    # Bumped price evaluations (CRN via shared seed).
+    # Spot-bumped calls use rescaled products; vol/skew-only calls use the original.
     P_up     = price_all(s_up,     SPOT + h_S, base_cal, product_up)
     P_dn     = price_all(s_dn,     SPOT - h_S, base_cal, product_dn)
     P_vup    = price_all(s_vup,    SPOT,        cal_vup,  product)
     P_vdn    = price_all(s_vdn,    SPOT,        cal_vdn,  product)
+    P_skup   = price_all(s_skup,   SPOT,        cal_skup, product)
+    P_skdn   = price_all(s_skdn,   SPOT,        cal_skdn, product)
     P_up_vup = price_all(s_up_vup, SPOT + h_S,  cal_vup,  product_up)
     P_dn_vup = price_all(s_dn_vup, SPOT - h_S,  cal_vup,  product_dn)
     P_up_vdn = price_all(s_up_vdn, SPOT + h_S,  cal_vdn,  product_up)
@@ -432,7 +451,9 @@ def compute_greeks(
         vega  = (P_vup[name] - P_vdn[name]) / (2.0 * h_v) * 0.01
         vanna = (  P_up_vup[name] - P_dn_vup[name]
                  - P_up_vdn[name] + P_dn_vdn[name]) / (4.0 * h_S * h_v)
-        greeks[name] = GreekResult(delta=delta, gamma=gamma, vega=vega, vanna=vanna)
+        skew_sens = (P_skup[name] - P_skdn[name]) / (2.0 * h_skew) * 0.01
+        greeks[name] = GreekResult(delta=delta, gamma=gamma, vega=vega, vanna=vanna,
+                                   skew_sens=skew_sens)
 
     return greeks
 
@@ -449,14 +470,17 @@ def compute_basket_greeks(
     n_paths: int,
     h_S_pct: float = 0.01,
     h_v: float = 0.001,
+    h_skew: float = 0.01,
 ) -> dict[str, BasketGreekResult]:
     """
-    Per-asset delta/gamma/vega/vanna via central finite differences: bump
-    ONE asset's spot/vol at a time, holding all other assets at base.
-    Cost: 8 bump points per asset (2 for delta/gamma, 2 for vega, 4 for
-    vanna cross terms) — 8N total for N assets, vs. the flat 8 in the
-    single-asset compute_greeks(). Only the bumped asset's Heston params are
-    recalibrated per vol bump (2N total recalibrations, not 2N × N).
+    Per-asset delta/gamma/vega/vanna/skew_sens via central finite differences:
+    bump ONE asset's spot/vol/skew at a time, holding all other assets at base.
+    Cost: 10 bump points per asset (2 for delta/gamma, 2 for vega, 2 for
+    skew_sens, 4 for vanna cross terms) — 10N total for N assets, vs. the flat
+    10 in the single-asset compute_greeks(). Only the bumped asset's Heston
+    params are recalibrated per vol/skew bump (4N total recalibrations, not
+    4N × N). skew_sens uses ImpliedVolSurface.with_skew_shift() -- see
+    compute_greeks()'s docstring for why this isolates slope from level (vega).
 
     Barrier convention — per-asset performance rescale, not barrier rescale
     ------------------------------------------------------------------------
@@ -489,12 +513,13 @@ def compute_basket_greeks(
     names = [n for n, _ in asset_surfaces]
     surfaces = {n: s for n, s in asset_surfaces}
     n_assets = len(names)
-    print(f"           ({8 * n_assets} bump evaluations for {n_assets} assets)")
+    print(f"           ({10 * n_assets} bump evaluations for {n_assets} assets)")
 
     delta = {m: {} for m in base_prices}
     gamma = {m: {} for m in base_prices}
     vega = {m: {} for m in base_prices}
     vanna = {m: {} for m in base_prices}
+    skew_sens = {m: {} for m in base_prices}
 
     def price_all(bumped_surfaces: dict[str, object],
                   bumped_heston: dict[str, HestonParams],
@@ -550,6 +575,20 @@ def compute_basket_greeks(
         P_vup = price_all(surf_vup, heston_vup)
         P_vdn = price_all(surf_vdn, heston_vdn)
 
+        # Pure skew bump: no spot change, so no rescale needed (same as vega above).
+        surf_skup = {**surfaces, asset_name: base_surf.with_skew_shift(+h_skew)}
+        surf_skdn = {**surfaces, asset_name: base_surf.with_skew_shift(-h_skew)}
+        heston_skup = {**base_heston,
+                       asset_name: calibrate_heston(surf_skup[asset_name],
+                                                    initial_params=base_heston.get(asset_name),
+                                                    fast=True)}
+        heston_skdn = {**base_heston,
+                       asset_name: calibrate_heston(surf_skdn[asset_name],
+                                                    initial_params=base_heston.get(asset_name),
+                                                    fast=True)}
+        P_skup = price_all(surf_skup, heston_skup)
+        P_skdn = price_all(surf_skdn, heston_skdn)
+
         # Vanna cross terms combine a vol shift with a spot bump -> rescale needed.
         surf_up_vup = {**surfaces, asset_name: surf_vup[asset_name].with_spot(base_surf.spot + h_S)}
         surf_dn_vup = {**surfaces, asset_name: surf_vup[asset_name].with_spot(base_surf.spot - h_S)}
@@ -565,6 +604,9 @@ def compute_basket_greeks(
             delta[model_name][asset_name] = (P_up[model_name] - P_dn[model_name]) / (2.0 * h_S)
             gamma[model_name][asset_name] = (P_up[model_name] - 2.0 * P0 + P_dn[model_name]) / (h_S ** 2)
             vega[model_name][asset_name] = (P_vup[model_name] - P_vdn[model_name]) / (2.0 * h_v) * 0.01
+            skew_sens[model_name][asset_name] = (
+                (P_skup[model_name] - P_skdn[model_name]) / (2.0 * h_skew) * 0.01
+            )
             vanna[model_name][asset_name] = (
                 P_up_vup[model_name] - P_dn_vup[model_name]
                 - P_up_vdn[model_name] + P_dn_vdn[model_name]
@@ -574,6 +616,7 @@ def compute_basket_greeks(
         model_name: BasketGreekResult(
             delta=delta[model_name], gamma=gamma[model_name],
             vega=vega[model_name], vanna=vanna[model_name],
+            skew_sens=skew_sens[model_name],
         )
         for model_name in base_prices
     }
@@ -589,6 +632,7 @@ def run_all(
     n_paths_greeks: int | None = None,
     h_S_pct: float = 0.01,
     h_v: float = 0.001,
+    h_skew: float = 0.01,
 ) -> list[ScenarioResult]:
     with open(scenarios_path) as f:
         spec = yaml.safe_load(f)
@@ -644,10 +688,10 @@ def run_all(
 
             if compute_greeks_flag:
                 print(f"           Computing basket Greeks  (N={n_greek_paths:,}, "
-                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp) ...")
+                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp, h_skew={h_skew}) ...")
                 basket_greeks = compute_basket_greeks(
                     cfg, asset_surfaces, correlation, base_heston, product, prices,
-                    seed, antithetic, n_greek_paths, h_S_pct=h_S_pct, h_v=h_v,
+                    seed, antithetic, n_greek_paths, h_S_pct=h_S_pct, h_v=h_v, h_skew=h_skew,
                 )
                 for model_name, gr in basket_greeks.items():
                     print(f"             {model_name}:")
@@ -656,7 +700,8 @@ def run_all(
                               f"  Δ={gr.delta[asset_name]:+.6f}"
                               f"  Γ={gr.gamma[asset_name]:+.6f}"
                               f"  ν={gr.vega[asset_name]:+.6f}"
-                              f"  vanna={gr.vanna[asset_name]:+.6f}")
+                              f"  vanna={gr.vanna[asset_name]:+.6f}"
+                              f"  skew_sens={gr.skew_sens[asset_name]:+.6f}")
 
         else:
             mc = cfg["market"]
@@ -684,18 +729,19 @@ def run_all(
 
             if compute_greeks_flag:
                 print(f"           Computing Greeks  (N={n_greek_paths:,}, "
-                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp) ...")
+                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp, h_skew={h_skew}) ...")
                 greeks = compute_greeks(
                     cfg, surface, base_cal, product, prices,
                     SPOT, RATE, DIV_YIELD, seed, antithetic, n_greek_paths,
-                    h_S_pct=h_S_pct, h_v=h_v,
+                    h_S_pct=h_S_pct, h_v=h_v, h_skew=h_skew,
                 )
                 for model_name, gr in greeks.items():
                     print(f"             {model_name:12s}"
                           f"  Δ={gr.delta:+.6f}"
                           f"  Γ={gr.gamma:+.6f}"
                           f"  ν={gr.vega:+.6f}"
-                          f"  vanna={gr.vanna:+.6f}")
+                          f"  vanna={gr.vanna:+.6f}"
+                          f"  skew_sens={gr.skew_sens:+.6f}")
 
         results.append(ScenarioResult(
             name=name, group=group, description=description,
@@ -768,6 +814,7 @@ def print_summary(results: list[ScenarioResult]) -> None:
         ("gamma", "Gamma  ∂²P/∂S²"),
         ("vega",  "Vega   ∂P/∂σ  (per 1% vol shift)"),
         ("vanna", "Vanna  ∂²P/(∂S ∂σ)"),
+        ("skew_sens", "Skew Sensitivity  ∂P/∂skew  (per 0.01 skew shift)"),
     ]
 
     gcol = 14
@@ -809,7 +856,8 @@ def print_basket_greeks_summary(results: list[ScenarioResult]) -> None:
                       f"  Δ={gr.delta[asset_name]:+.6f}"
                       f"  Γ={gr.gamma[asset_name]:+.6f}"
                       f"  ν={gr.vega[asset_name]:+.6f}"
-                      f"  vanna={gr.vanna[asset_name]:+.6f}")
+                      f"  vanna={gr.vanna[asset_name]:+.6f}"
+                      f"  skew_sens={gr.skew_sens[asset_name]:+.6f}")
     print()
 
 
@@ -820,7 +868,7 @@ def save_csv(results: list[ScenarioResult], path: str) -> None:
     has_durations = any(r.durations for r in results)
     has_greeks = any(r.greeks for r in results)
     has_basket_greeks = any(r.basket_greeks for r in results)
-    greek_attrs = ["delta", "gamma", "vega", "vanna"]
+    greek_attrs = ["delta", "gamma", "vega", "vanna", "skew_sens"]
 
     # Union of (model_name, asset_name) pairs seen across basket scenarios,
     # in first-seen order -- columns are the same for every row.
@@ -894,13 +942,16 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true",
                         help="Print calibrated model parameters for each scenario")
     parser.add_argument("--greeks", action="store_true",
-                        help="Compute delta, gamma, vega, vanna via finite differences")
+                        help="Compute delta, gamma, vega, vanna, skew_sens via finite differences")
     parser.add_argument("--n-paths-greeks", type=int, default=None,
                         help="MC paths for Greek FD bumps (default: same as --n-paths)")
     parser.add_argument("--h-spot-pct", type=float, default=0.01,
                         help="Spot bump as fraction of spot for FD (default: 0.01 = 1%%)")
     parser.add_argument("--h-vol", type=float, default=0.001,
                         help="Parallel vol bump for FD in absolute terms (default: 0.001 = 10bp)")
+    parser.add_argument("--h-skew", type=float, default=0.01,
+                        help="Skew-coefficient bump for FD (see ImpliedVolSurface.with_skew_shift, "
+                             "default: 0.01)")
     args = parser.parse_args()
 
     print(f"Autocallable Scenario Runner")
@@ -908,7 +959,8 @@ def main() -> None:
     print(f"  N paths:   {args.n_paths:,} per (scenario × model)")
     if args.greeks:
         ngp = args.n_paths_greeks or args.n_paths
-        print(f"  Greeks:    ON  (N={ngp:,}, h_S={args.h_spot_pct*100:.1f}%, h_v={args.h_vol*10000:.0f}bp)")
+        print(f"  Greeks:    ON  (N={ngp:,}, h_S={args.h_spot_pct*100:.1f}%, h_v={args.h_vol*10000:.0f}bp, "
+              f"h_skew={args.h_skew})")
 
     results = run_all(
         args.scenarios,
@@ -918,6 +970,7 @@ def main() -> None:
         n_paths_greeks=args.n_paths_greeks,
         h_S_pct=args.h_spot_pct,
         h_v=args.h_vol,
+        h_skew=args.h_skew,
     )
     print_summary(results)
     save_csv(results, args.output)

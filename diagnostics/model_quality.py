@@ -10,10 +10,16 @@ Run with:
     .venv/bin/python diagnostics/model_quality.py
     .venv/bin/python diagnostics/model_quality.py --config my_note.yaml
     .venv/bin/python diagnostics/model_quality.py --n-paths 50000 --output results/fit.png
+
+Scenario mode -- fit check + raw vol surface shape for every scenario in a
+scenarios YAML file (same base_config/overrides format as scenarios/run_scenarios.py):
+    .venv/bin/python diagnostics/model_quality.py --scenarios scenarios/sce_std_els_by_market.yaml
+    .venv/bin/python diagnostics/model_quality.py --scenarios scenarios/sce_std_els_by_market.yaml --group market
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import os
 import argparse
@@ -32,11 +38,18 @@ from models.local_vol import LocalVolModel
 from models.heston import HestonModel, HestonParams
 from models.sabr import SABRModel, SABRParams
 from engine.black_scholes import bs_price, implied_vol as bs_implied_vol
+from scenarios.run_scenarios import deep_merge
 
 # ── Diagnostic grid defaults ───────────────────────────────────────────────────
 DEFAULT_MATURITIES = [0.1, 0.2, 0.3, 0.5]
 DEFAULT_MONEYNESS = np.linspace(0.70, 1.30, 13)   # K/S0
 DEFAULT_N_PATHS = 30_000
+# Scenario mode runs the fit check N times (once per scenario) -- default to
+# fewer paths than the single-config default to keep total runtime reasonable.
+SCENARIO_DEFAULT_N_PATHS = 10_000
+# Raw surface shape needs no MC/calibration, so it can afford a much finer grid.
+SURFACE_PLOT_N_T = 60
+SURFACE_PLOT_N_K = 60
 
 
 def load_config(path: str) -> dict:
@@ -180,16 +193,80 @@ def print_table(
         print(row)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Vol surface fit diagnostic")
-    parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--n-paths", type=int, default=DEFAULT_N_PATHS,
-                        help=f"MC paths per (model, maturity) (default {DEFAULT_N_PATHS:,})")
-    parser.add_argument("--output", default="diagnostics/vol_surface_fit.png",
-                        help="Path to save the smile plot")
-    args = parser.parse_args()
+def slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return s or "scenario"
 
-    cfg = load_config(args.config)
+
+def plot_raw_surface(surface, title: str, out_path: str,
+                     n_T: int = SURFACE_PLOT_N_T, n_K: int = SURFACE_PLOT_N_K,
+                     moneyness_range: tuple[float, float] = (0.6, 1.4)) -> None:
+    """
+    Heatmap of the input implied-vol surface itself (no MC, no calibration) --
+    shows exactly what shape the vol_surface: parameters actually produce.
+
+    moneyness_range is a practical display window, NOT surface.strike_range --
+    the surface's internal strike grid is auto-sized to cover +/-4.5 sigma
+    (often 20-1200% moneyness) purely so the Dupire spline never has to
+    extrapolate; that range is unreadable as a plot.
+    """
+    T_min, T_max_surf = surface.maturity_range
+    T_min = max(T_min, 1e-3)
+    Ts = np.linspace(T_min, T_max_surf, n_T)
+    Ks = np.linspace(surface.spot * moneyness_range[0], surface.spot * moneyness_range[1], n_K)
+
+    iv_grid = np.array([surface.implied_vol(T, Ks) for T in Ts])  # (n_T, n_K)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    moneyness = Ks / surface.spot * 100
+    mesh = ax.pcolormesh(moneyness, Ts, iv_grid * 100, shading="auto", cmap="viridis")
+    fig.colorbar(mesh, ax=ax, label="Implied Vol (%)")
+    ax.set_xlabel("Moneyness  K / S₀  (%)")
+    ax.set_ylabel("Maturity T (years)")
+    ax.set_title(f"Input Vol Surface — {title}", fontsize=11, fontweight="bold")
+    plt.tight_layout()
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fit_summary_line(model_names: list[str],
+                     input_ivs_by_T: dict[float, np.ndarray],
+                     model_ivs_by_T: dict[float, dict[str, np.ndarray]]) -> str:
+    """One line per scenario: mean/max abs IV error (bp) per model, across all maturities/strikes."""
+    parts = []
+    for name in model_names:
+        diffs = np.concatenate([
+            (model_ivs_by_T[T][name] - input_ivs_by_T[T]) * 10_000
+            for T in input_ivs_by_T
+        ])
+        valid = diffs[~np.isnan(diffs)]
+        if len(valid):
+            parts.append(f"{name}: mean={valid.mean():+.1f}bp max={np.max(np.abs(valid)):.1f}bp")
+        else:
+            parts.append(f"{name}: N/A")
+    return "  |  ".join(parts)
+
+
+def run_fit_check(
+    cfg: dict,
+    label: str,
+    n_paths: int,
+    plot_path: str,
+) -> str | None:
+    """
+    Run the fit check (calibrate + MC smile pricing vs input surface) for one
+    config, print the per-strike tables, save the fit plot, and return the
+    one-line error summary (or None if this is a basket config, which this
+    diagnostic doesn't support).
+    """
+    if "assets" in cfg:
+        print(f"  [{label}] basket config -- fit check not supported for multi-asset configs, skipping")
+        return None
+
     mc_cfg = cfg["market"]
     sc_cfg = cfg["simulation"]
 
@@ -198,54 +275,38 @@ def main() -> None:
     DIV_YIELD = float(mc_cfg["div_yield"])
     SEED = int(sc_cfg["seed"])
     ANTITHETIC = bool(sc_cfg.get("antithetic", True))
-    N_PATHS = args.n_paths
-
-    print("=" * 65)
-    print("Model Quality Diagnostic — Vol Surface Fit")
-    print("=" * 65)
-    print(f"  Config:   {args.config}")
-    print(f"  Spot: {SPOT}  |  Rate: {RATE:.1%}  |  Div yield: {DIV_YIELD:.1%}")
-    print(f"  N paths per (model, maturity): {N_PATHS:,}")
-    print()
 
     surface = build_surface(cfg, SPOT, RATE, DIV_YIELD)
     T_min, T_max_surf = surface.maturity_range
 
-    print("Calibrating models...")
+    print(f"  Calibrating models for [{label}]...")
     models = build_models(cfg, surface, SPOT, RATE, DIV_YIELD, SEED)
     model_names = [name for name, _ in models]
-    print()
 
-    # Filter maturities to surface range
     maturities = [T for T in DEFAULT_MATURITIES if T_min < T <= T_max_surf]
     if not maturities:
         maturities = [T_max_surf]
 
     strikes = SPOT * DEFAULT_MONEYNESS
 
-    # ── Input surface IVs ──────────────────────────────────────────────────────
     input_ivs_by_T: dict[float, np.ndarray] = {
         T: np.array([surface.implied_vol(T, K) for K in strikes])
         for T in maturities
     }
 
-    # ── Model-implied vols ─────────────────────────────────────────────────────
     model_ivs_by_T: dict[float, dict[str, np.ndarray]] = {T: {} for T in maturities}
-
     for name, model in models:
         for T in maturities:
-            print(f"  Pricing smile: {name:10s}  T={T:.1f}y  ({N_PATHS:,} paths)...", end=" ", flush=True)
-            ivs = price_smile(model, SPOT, strikes, T, RATE, DIV_YIELD, N_PATHS, ANTITHETIC)
+            print(f"    Pricing smile: {name:10s}  T={T:.1f}y  ({n_paths:,} paths)...", end=" ", flush=True)
+            ivs = price_smile(model, SPOT, strikes, T, RATE, DIV_YIELD, n_paths, ANTITHETIC)
             model_ivs_by_T[T][name] = ivs
             n_valid = int(np.sum(~np.isnan(ivs)))
             print(f"done ({n_valid}/{len(strikes)} IVs solved)")
 
-    # ── Print tables ───────────────────────────────────────────────────────────
     print()
     for T in maturities:
         print_table(T, DEFAULT_MONEYNESS, input_ivs_by_T[T], model_names, model_ivs_by_T[T])
 
-    # ── Plot ───────────────────────────────────────────────────────────────────
     n_T = len(maturities)
     fig, axes = plt.subplots(1, n_T, figsize=(5 * n_T, 4), sharey=False)
     if n_T == 1:
@@ -271,15 +332,117 @@ def main() -> None:
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3, linestyle=":")
 
-    fig.suptitle("Vol Surface Fit: Input vs Model-Implied Vols", fontsize=13, fontweight="bold")
+    fig.suptitle(f"Vol Surface Fit: Input vs Model-Implied Vols — {label}", fontsize=13, fontweight="bold")
     plt.tight_layout()
 
-    out_path = args.output
-    out_dir = os.path.dirname(out_path)
+    out_dir = os.path.dirname(plot_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\nPlot saved → {out_path}")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved → {plot_path}")
+
+    return fit_summary_line(model_names, input_ivs_by_T, model_ivs_by_T)
+
+
+def run_scenarios_mode(args: argparse.Namespace) -> None:
+    with open(args.scenarios) as f:
+        spec = yaml.safe_load(f)
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(args.scenarios)))
+    base_path = os.path.join(project_root, spec["base_config"])
+    with open(base_path) as f:
+        base_cfg = yaml.safe_load(f)
+
+    n_paths = args.n_paths if args.n_paths is not None else SCENARIO_DEFAULT_N_PATHS
+    scenarios = spec["scenarios"]
+    if args.group:
+        scenarios = [s for s in scenarios if s.get("group") == args.group]
+
+    print("=" * 65)
+    print("Model Quality Diagnostic — Scenario Fit Check")
+    print("=" * 65)
+    print(f"  Scenarios:  {args.scenarios}")
+    print(f"  Base config: {spec['base_config']}")
+    print(f"  N paths per (model, maturity): {n_paths:,}")
+    print(f"  Output dir:  {args.output_dir}")
+    print()
+
+    summaries: list[tuple[str, str, str | None]] = []   # (name, group, summary)
+
+    for idx, scenario in enumerate(scenarios):
+        name = scenario["name"]
+        group = scenario.get("group", "")
+        overrides = scenario.get("overrides", {})
+        cfg = deep_merge(base_cfg, overrides)
+        slug = slugify(name)
+
+        print(f"[{idx + 1}/{len(scenarios)}] {group.upper():7s} | {name}")
+
+        if "assets" not in cfg:
+            surface = build_surface(cfg, float(cfg["market"]["spot"]),
+                                    float(cfg["market"]["rate"]),
+                                    float(cfg["market"]["div_yield"]))
+            plot_raw_surface(surface, name, os.path.join(args.output_dir, f"{slug}_surface.png"))
+
+        summary = run_fit_check(
+            cfg, name, n_paths,
+            os.path.join(args.output_dir, f"{slug}_fit.png"),
+        )
+        summaries.append((name, group, summary))
+        print()
+
+    print("=" * 65)
+    print("  Fit Summary (mean/max abs IV error across all maturities & strikes)")
+    print("=" * 65)
+    current_group = None
+    for name, group, summary in summaries:
+        if group != current_group:
+            current_group = group
+            print(f"\n  ── {group.upper()} ──")
+        if summary is None:
+            print(f"  {name:<30}  (skipped -- basket config)")
+        else:
+            print(f"  {name:<30}  {summary}")
+    print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Vol surface fit diagnostic")
+    parser.add_argument("--config", default="config.yaml",
+                        help="Single config to check (ignored if --scenarios is given)")
+    parser.add_argument("--scenarios", default=None,
+                        help="Scenario YAML (base_config + scenarios:, same format as "
+                             "scenarios/run_scenarios.py) -- runs the fit check and raw "
+                             "surface plot for every scenario instead of a single config")
+    parser.add_argument("--group", default=None,
+                        help="Only run scenarios in this group (--scenarios mode only)")
+    parser.add_argument("--n-paths", type=int, default=None,
+                        help=f"MC paths per (model, maturity) (default {DEFAULT_N_PATHS:,} "
+                             f"single-config, {SCENARIO_DEFAULT_N_PATHS:,} scenario mode)")
+    parser.add_argument("--output", default="diagnostics/vol_surface_fit.png",
+                        help="Path to save the smile plot (single-config mode only)")
+    parser.add_argument("--output-dir", default="diagnostics/scenario_fit",
+                        help="Directory to save per-scenario plots (--scenarios mode only)")
+    args = parser.parse_args()
+
+    if args.scenarios:
+        run_scenarios_mode(args)
+        return
+
+    cfg = load_config(args.config)
+    n_paths = args.n_paths if args.n_paths is not None else DEFAULT_N_PATHS
+
+    print("=" * 65)
+    print("Model Quality Diagnostic — Vol Surface Fit")
+    print("=" * 65)
+    print(f"  Config:   {args.config}")
+    print(f"  Spot: {float(cfg['market']['spot'])}  |  Rate: {float(cfg['market']['rate']):.1%}"
+          f"  |  Div yield: {float(cfg['market']['div_yield']):.1%}")
+    print(f"  N paths per (model, maturity): {n_paths:,}")
+    print()
+
+    run_fit_check(cfg, args.config, n_paths, args.output)
 
 
 if __name__ == "__main__":

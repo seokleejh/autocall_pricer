@@ -191,6 +191,30 @@ class ImpliedVolSurface:
             self.spot, self.rate, self.div_yield,
         )
 
+    def with_skew_shift(self, h: float, T_floor: float = 0.25) -> "ImpliedVolSurface":
+        """
+        New surface with a skew bump: tilts the smile around each maturity's own
+        ATM point (zero at K = F(T)), for skew-sensitivity ("skew vega") Greeks.
+
+            new_vol(T, K) = vol(T, K) + [h / sqrt(max(T, T_floor))] * ln(K / F(T))
+
+        The 1/sqrt(T) decay and T_floor=0.25 match term_structure_surface's own
+        `skew` parameter convention (quoted at the T=1y reference, floored at 3m
+        to avoid blowing up as T -> 0) -- so h is in the same units as that
+        config field regardless of which factory built this surface, since the
+        bump only touches the stored vol grid.
+
+        Zero at ATM by construction, so this does not double-count with vega.
+        """
+        F = self.forward(self._T)                              # (M,)
+        x = np.log(self._K[None, :] / F[:, None])               # (M, K)
+        decay = h / np.sqrt(np.maximum(self._T, T_floor))        # (M,)
+        bumped = np.clip(self._vols + decay[:, None] * x, 1e-4, None)
+        return ImpliedVolSurface(
+            self._T, self._K, bumped,
+            self.spot, self.rate, self.div_yield,
+        )
+
 
 # ------------------------------------------------------------------
 # Factory helpers

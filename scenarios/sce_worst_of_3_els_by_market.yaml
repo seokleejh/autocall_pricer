@@ -3,11 +3,13 @@
 # Base config: configs/config_worst_of_2asset.yaml
 # =============================================================================
 
-base_config: configs/config_worst_of_2asset.yaml
+base_config: configs/config_worst_of_3_els.yaml
+
+
 
 scenarios:
 
-  - name: Base case (rho=0.60)
+  - name: Base case 
     group: correlation
     description: >
       Benchmark correlation from the base config.
@@ -19,8 +21,9 @@ scenarios:
       assets, which worsens the worst-of outcome and should lower price.
     overrides:
       correlation:
-        - [1.00, 0.20]
-        - [0.20, 1.00]
+        - [1.00, 0.20, 0.20]
+        - [0.20, 1.00, 0.20]
+        - [0.20, 0.20, 1.00]
 
   - name: High correlation (rho=0.90)
     group: correlation
@@ -29,5 +32,6 @@ scenarios:
       single-asset autocall on either asset.
     overrides:
       correlation:
-        - [1.00, 0.90]
-        - [0.90, 1.00]
+        - [1.00, 0.90, 0.90]
+        - [0.90, 1.00, 0.90]
+        - [0.90, 0.90, 1.00]

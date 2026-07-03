@@ -12,7 +12,7 @@
 # A large spread signals high model risk for that scenario.
 # =============================================================================
 
-base_config: configs/config_std_els.yaml   # Path to base config (relative to project root)
+base_config: configs/config_low_coupon_els.yaml   # Path to base config (relative to project root)
 
 scenarios:
 

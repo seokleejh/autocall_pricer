@@ -14,6 +14,7 @@
 5. [Running a Single Pricing](#5-running-a-single-pricing)
    - [Fit check modes](#51-fit-check-modes)
    - [Calibration diagnostics](#52-calibration-diagnostics)
+   - [Scenario fit check and surface shapes](#53-scenario-fit-check-and-surface-shapes)
 6. [Scenario Analysis](#6-scenario-analysis)
    - [Basic run](#61-basic-run)
    - [Computing Greeks](#62-computing-greeks)
@@ -23,6 +24,7 @@
 8. [Python API](#8-python-api)
 9. [Running the Tests](#9-running-the-tests)
 10. [Performance Guide](#10-performance-guide)
+11. [Worst-of Basket Pricing](#11-worst-of-basket-pricing)
 
 ---
 
@@ -57,6 +59,9 @@ level mismatch — they reflect genuine disagreement about the joint distributio
 |--------|---------|
 | `main.py` | Price a single note; inspect calibration quality |
 | `scenarios/run_scenarios.py` | Run a battery of scenario overrides; compare model spreads across product variants or market regimes |
+
+Both entry points also support **worst-of basket** notes (payoff depends on the worst-performing
+of several correlated underlyings) — see [Section 11](#11-worst-of-basket-pricing).
 
 ---
 
@@ -410,6 +415,65 @@ skew is wrong.
 - If Heston or SABR calibration printed warnings during `main.py`
 - Before pricing a new product with barriers significantly different from ATM (deep OTM/ITM
   paths are where model errors matter most)
+
+### 5.3 Scenario fit check and surface shapes
+
+Section 5.2 checks calibration fit for one config. To check every market scenario in a scenario
+file in one pass — and to see the actual vol surface shape each scenario's parameters produce —
+use `--scenarios` instead of `--config`:
+
+```bash
+python diagnostics/model_quality.py --scenarios scenarios/sce_std_els_by_market.yaml
+
+# Only the "market" group, fewer paths for a quick look
+python diagnostics/model_quality.py --scenarios scenarios/sce_std_els_by_market.yaml \
+    --group market --n-paths 5000
+```
+
+For every scenario, this:
+1. Applies the scenario's `overrides` to `base_config` the same way `scenarios/run_scenarios.py`
+   does (`deep_merge`), so scenario files are interchangeable between the two tools.
+2. Saves a **raw vol surface heatmap** — implied vol evaluated directly on a (T, K) grid from the
+   `vol_surface:` parameters, with no Monte Carlo and no model calibration involved. This is the
+   fastest way to sanity-check that a parameter change (e.g. `skew`, `kappa`, `convexity`) produced
+   the surface shape you expected, independent of how well any model fits it.
+3. Runs the same fit check as [Section 5.2](#52-calibration-diagnostics) (calibrate Heston/SABR,
+   MC-price the smile, compare to the input surface) and saves the usual fit plot and per-strike
+   tables.
+4. Prints a **one-line summary per scenario** — mean and max absolute IV error in bp per model,
+   across all maturities and strikes — so you can scan every scenario for outliers without reading
+   every per-strike table.
+
+```
+=================================================================
+  Fit Summary (mean/max abs IV error across all maturities & strikes)
+=================================================================
+
+  ── MARKET ──
+  Base case                       Local Vol: mean=-1.7bp max=273.6bp  |  Heston: mean=+28.5bp max=296.4bp
+  Steep skew                      Local Vol: mean=-5.3bp max=561.1bp  |  Heston: mean=-315.5bp max=770.3bp
+```
+
+A scenario whose max/mean error is far larger than its neighbors (like "Steep skew" above) is where
+model risk concentrates — worth a closer look at that scenario's saved fit plot before trusting its
+price in a scenario comparison.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--scenarios` | *(none)* | Scenario YAML (same `base_config:` + `scenarios:` format as `run_scenarios.py`). Enables scenario mode; `--config` is ignored if this is set. |
+| `--group` | *(all)* | Only run scenarios whose `group:` matches this value |
+| `--n-paths` | 10,000 | MC paths per (model, maturity) pair — lower than the single-config default (30,000) since this runs once per scenario |
+| `--output-dir` | `diagnostics/scenario_fit` | Directory for per-scenario plots: `<scenario>_surface.png` and `<scenario>_fit.png` |
+
+**Basket configs** (`assets:` present after merging overrides) are detected and skipped with a
+console note — this diagnostic's calibration/fit-check logic is single-asset only (see
+[Section 11](#11-worst-of-basket-pricing) for basket pricing).
+
+**Surface plot display window**: the heatmap always uses a 60%–140% moneyness window, regardless
+of the surface's *internal* strike grid. `term_structure_surface`'s internal grid is auto-sized to
+cover ±4.5σ (often 20%–1200%+ moneyness) purely so the Dupire local-vol spline never has to
+extrapolate — plotting that full range would compress the readable region into a sliver at the
+left edge of the chart.
 
 ### Reading the output
 
@@ -781,8 +845,12 @@ capital_protected = AutocallableNote(
 | `test_vol_surface.py` | `implied_vol`, `local_vol`, `local_vol_batch`, `with_spot`, `with_vol_shift` | Fully deterministic |
 | `test_models.py` | Risk-neutral drift E[S(T)/S(0)] = exp((r−q)T) for all models; discount bond pricing | Stochastic; uses fixed seed + antithetic for stable assertions |
 | `test_greeks.py` | `_rescale_product_barriers` absolute level preservation; delta sign; vega sign | Mix of deterministic and stochastic |
+| `test_basket_payoff.py` | Worst-of aggregation (min across assets per date) feeding the unmodified `evaluate_payoff` | Fully deterministic — hand-crafted per-asset arrays |
+| `test_basket_models.py` | Correlated path shape/reproducibility; correlation recovery (exact for Local Vol, approximate for Heston); price monotonicity in correlation | Stochastic; some cases use large path counts (200k) for tight correlation-recovery tolerances |
+| `test_basket_greeks.py` | Per-asset delta/gamma sign and non-degeneracy; no barrier mutation; bumped-asset isolation | Mix of deterministic and stochastic |
 
-All 50 tests should pass in under 35 seconds.
+All tests should pass in a few minutes (the basket correlation-recovery tests use large path
+counts and dominate the runtime).
 
 ---
 
@@ -831,3 +899,120 @@ Greek estimates are noisy because they are FD differences of two MC prices. Thre
 Set `sabr: false` or `heston: false` in the config (or in a scenario override) to skip a model.
 Local Vol is cheapest per path but most expensive to vectorise at very high path counts due to the
 Dupire grid evaluation; Heston and SABR scale well with path count.
+
+---
+
+## 11. Worst-of Basket Pricing
+
+A worst-of basket note pays based on the **worst-performing** of several correlated underlyings —
+the autocall, coupon, and capital barriers all apply to `min_i(S_i(t) / S_i(0))`, not to any single
+asset. Supported models: **Local Vol** and **Heston**. **SABR is not supported** for basket pricing.
+
+### 11.1 Config schema
+
+Add a top-level `assets:` list and `correlation:` matrix to switch a config into basket mode. When
+`assets:` is present, the single-asset `market:` and top-level `vol_surface:` blocks are ignored —
+`product:`, `simulation:`, and `models:` are unchanged and reused as-is. See
+[configs/config_worst_of_2asset.yaml](configs/config_worst_of_2asset.yaml) for a full working example.
+
+```yaml
+assets:
+  - name: AssetA
+    spot: 100.0
+    rate: 0.03          # all assets must share the same rate (v1 constraint)
+    div_yield: 0.01     # div_yield may differ per asset
+    vol_surface:        # identical schema to the single-asset vol_surface: block
+      type: term_structure
+      vol_short: 0.25
+      vol_long: 0.18
+      kappa: 1.5
+      skew: -0.10
+      convexity: 0.02
+      T_max: 5.0
+
+  - name: AssetB
+    spot: 100.0
+    rate: 0.03
+    div_yield: 0.02
+    vol_surface:
+      type: term_structure
+      vol_short: 0.30
+      vol_long: 0.22
+      kappa: 1.3
+      skew: -0.12
+      convexity: 0.02
+      T_max: 5.0
+
+correlation:            # n × n, order matches the assets: list
+  - [1.00, 0.60]
+  - [0.60, 1.00]
+
+product:
+  # unchanged schema — barriers apply to worst-of performance, not any one asset
+  autocall_barriers: [0.85, 0.85, 0.80, 0.75, 0.70, 0.65]
+  ...
+
+models:
+  local_vol: true
+  heston: true
+  sabr: false          # ignored in basket mode — not supported
+```
+
+### 11.2 Running
+
+```bash
+python main.py --config configs/config_worst_of_2asset.yaml --no-fit-check
+
+python scenarios/run_scenarios.py \
+    --scenarios scenarios/sce_worst_of_2asset.yaml \
+    --n-paths 20000 --greeks --output basket_results.csv
+```
+
+`main.py` prints "Basket Local Vol" / "Basket Heston" pricing lines instead of the single-asset
+model names; `--full-diagnostic` is not yet supported in basket mode.
+
+### 11.3 Correlation: what to expect from each model
+
+- **Local Vol**: correlation is applied directly to the driving Brownians via Cholesky decomposition
+  — the realized asset-asset correlation matches your `correlation:` input almost exactly.
+- **Heston**: each asset keeps its own independent variance process (no cross-asset vol-vol
+  correlation), which has two consequences worth knowing before you rely on the number:
+  1. **Feasibility ceiling.** Because each asset's own spot-vol correlation `rho` "uses up" some of
+     its spot shock's variance, the maximum achievable correlation between two assets is
+     `sqrt(1-rho_a²) × sqrt(1-rho_b²)`. For typical calibrated equity `rho` (−0.6 to −0.8), this
+     ceiling is often only **~0.45–0.65** — well below correlations commonly assumed for same-sector
+     equities. Requesting a higher correlation doesn't error; it's automatically clipped to the
+     feasible ceiling with a printed warning (e.g. `requested correlation ... was clipped: (0,1):
+     +0.600 -> +0.521`). If you need exact control over a high target correlation, use Local Vol
+     instead.
+  2. **Residual attenuation.** Even within the feasible ceiling, the *realized* log-return
+     correlation tends to run somewhat below the target, because each asset's variance evolves
+     independently over the life of the trade (more pronounced for higher vol-of-vol and longer
+     maturities). Use Basket Local Vol if you need the realized correlation to match your input
+     closely; use Basket Heston if the primary concern is skew/smile dynamics rather than exact
+     correlation control.
+
+### 11.4 Basket Greeks
+
+`--greeks` computes **per-asset** delta, gamma, vega, and vanna — one full set per underlying, not
+one aggregate number:
+
+```
+Basket Local Vol:
+  AssetA        Δ=+0.000223  Γ=-0.018895  ν=-0.000884  vanna=+0.090661
+  AssetB        Δ=-0.000613  Γ=-0.018393  ν=-0.004090  vanna=-0.115756
+```
+
+Cost scales linearly with the number of assets: **8N bump evaluations** for N assets (vs. a flat 8
+in the single-asset case) — 2 for delta/gamma, 2 for vega, 4 for vanna cross-terms, per asset. Only
+the bumped asset's Heston parameters are recalibrated per vol bump (2N recalibrations total, not
+2N × N), but runtime still grows with basket size — a printed line shows the total bump count before
+the computation starts.
+
+**Barrier convention**: unlike the single-asset Greeks (which rescale the note's barriers to hold
+their absolute dollar level fixed under a spot bump), basket Greeks rescale the **bumped asset's own
+performance** before taking the worst-of min, leaving the barrier untouched. A worst-of barrier is a
+single fraction shared across whichever asset is currently worst — it can't be rescaled per-asset
+the way a single-asset barrier can. The two approaches are mathematically equivalent; this
+distinction matters in practice because Heston's simulated performance is scale-invariant to the
+spot level, so without this rescale, Heston's basket delta/gamma would come out as exactly zero.
