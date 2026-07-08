@@ -520,7 +520,8 @@ python scenarios/run_scenarios.py \
     --n-paths 20000 \
     --n-paths-greeks 10000 \
     --h-spot-pct 0.01 \
-    --h-vol 0.001
+    --h-vol 0.001 \
+    --h-skew 0.01
 ```
 
 | Flag | Default | Description |
@@ -529,9 +530,10 @@ python scenarios/run_scenarios.py \
 | `--n-paths-greeks` | same as `--n-paths` | Paths for FD bumps (fewer paths → faster but noisier) |
 | `--h-spot-pct` | 0.01 | Spot bump as fraction of spot (1%) |
 | `--h-vol` | 0.001 | Parallel implied vol shift for vega/vanna (10 bp) |
+| `--h-skew` | 0.01 | Skew-coefficient bump for skew sensitivity (see [below](#skew-sensitivity-convention)) |
 
 **Runtime**: with 10,000 paths and all three models, Greeks add ~2–5 minutes per scenario
-(8 bumped evaluations × 3 models, plus 2 vol-surface recalibrations). See [Section 10](#10-performance-guide).
+(10 bumped evaluations × 3 models, plus 4 vol-surface recalibrations). See [Section 10](#10-performance-guide).
 
 #### Delta convention
 
@@ -547,6 +549,32 @@ contract inception and do not move when today's spot price changes.
 
 Vega is reported **per 1 percentage-point (100 bp) parallel shift** in implied vol. So if Heston
 shows vega = −0.05, a 1 vol-point increase in implied vols lowers the note value by 5% of notional.
+
+#### Skew sensitivity convention
+
+Skew sensitivity is not a standard Greek — it measures the note's exposure to the **slope** of the
+smile (the skew), as distinct from vega's exposure to the smile's **level**. It is computed via
+`ImpliedVolSurface.with_skew_shift(h)`, which tilts the surface around each maturity's own
+at-the-forward point:
+
+```
+new_vol(T, K) = vol(T, K) + [h / sqrt(max(T, 0.25))] * ln(K / F(T))
+```
+
+Two properties make this a clean, isolated slope measure:
+
+- **Zero at the forward for every maturity** (`ln(K/F(T)) = 0` when `K = F(T)`), so the bump never
+  moves the ATM level and therefore never double-counts with vega.
+- **Decays as `1/√T`**, identical to `term_structure_surface`'s own `skew` parameter convention
+  (quoted at the T=1y reference, floored at 3 months). This means **short maturities get a larger
+  tilt than long ones** — e.g. with the default `h=0.01`, the bump at T=3 months is 4× the size of
+  the bump at T=4 years. This matches the empirical fact that skew is steeper (in absolute
+  ln-moneyness terms) at the short end, and it lets `skew_sens` correspond to `h` in the same units
+  as the config's own `skew:` field, regardless of which factory built the surface (the bump only
+  touches the stored vol grid, not the parametric generator).
+
+Like vega, it is reported **per 0.01 shift** in the skew coefficient and requires Heston/SABR to be
+re-calibrated on the bumped surface (same fast warm-start approach as the vega bumps).
 
 ### 6.3 Reading the output
 
@@ -600,6 +628,9 @@ typically means more upward drift than the physical measure. Use it to:
 
   ── Vanna  ∂²P/(∂S ∂σ) ──
   ...
+
+  ── Skew Sensitivity  ∂P/∂skew  (per 0.01 skew shift) ──
+  ...
 ```
 
 All Greeks are per unit notional in the same currency as `spot`.
@@ -617,7 +648,8 @@ spread_bp,
 <model>_delta × 3,   (only if --greeks)
 <model>_gamma × 3,
 <model>_vega × 3,
-<model>_vanna × 3
+<model>_vanna × 3,
+<model>_skew_sens × 3
 ```
 
 Load in Python:
@@ -868,20 +900,21 @@ counts and dominate the runtime).
 ### Greeks runtime
 
 Each call to `--greeks` requires:
-- 8 bumped pricing evaluations (spot ±, vol ±, cross-terms)
-- 2 vol surface recalibrations for Heston (fast warm-start mode, ~0.8s each)
+- 10 bumped pricing evaluations (spot ±, vol ±, skew ±, vanna cross-terms)
+- 4 vol surface recalibrations for Heston (fast warm-start mode, ~0.8s each) — 2 for the vol bumps,
+  2 for the skew bumps
 
 Per scenario with 10,000 paths:
 
 | Contribution | Time |
 |---|---|
-| 8 × Local Vol pricings | ~5s |
-| 8 × Heston pricings | ~3s |
-| 8 × SABR pricings | ~3s |
-| 2 × Heston recalibrations | ~2s |
-| **Total** | **~13s per scenario** |
+| 10 × Local Vol pricings | ~6s |
+| 10 × Heston pricings | ~4s |
+| 10 × SABR pricings | ~4s |
+| 4 × Heston recalibrations | ~3s |
+| **Total** | **~17s per scenario** |
 
-For a 12-scenario run with Greeks: allow ~3–5 minutes.
+For a 12-scenario run with Greeks: allow ~4–6 minutes.
 
 ### Reducing Greek noise
 
@@ -890,7 +923,7 @@ Greek estimates are noisy because they are FD differences of two MC prices. Thre
 1. **Increase `--n-paths-greeks`**: directly reduces noise but increases runtime proportionally.
 2. **Increase `--h-spot-pct`**: larger bump reduces relative noise but adds truncation error. The
    default (1%) is usually a good balance; 2% is reasonable for a first pass.
-3. **Common random numbers (CRN)**: the pricer already uses this — all 8 bumped evaluations share
+3. **Common random numbers (CRN)**: the pricer already uses this — all 10 bumped evaluations share
    the same seed, so MC noise largely cancels in the FD numerator. Do not change the seed between
    the base and bumped runs if you replicate the Greek logic in your own code.
 
@@ -994,20 +1027,26 @@ model names; `--full-diagnostic` is not yet supported in basket mode.
 
 ### 11.4 Basket Greeks
 
-`--greeks` computes **per-asset** delta, gamma, vega, and vanna — one full set per underlying, not
-one aggregate number:
+`--greeks` computes **per-asset** delta, gamma, vega, vanna, and skew sensitivity — one full set
+per underlying, not one aggregate number:
 
 ```
 Basket Local Vol:
-  AssetA        Δ=+0.000223  Γ=-0.018895  ν=-0.000884  vanna=+0.090661
-  AssetB        Δ=-0.000613  Γ=-0.018393  ν=-0.004090  vanna=-0.115756
+  AssetA        Δ=+0.000223  Γ=-0.018895  ν=-0.000884  vanna=+0.090661  skew_sens=+0.000432
+  AssetB        Δ=-0.000613  Γ=-0.018393  ν=-0.004090  vanna=-0.115756  skew_sens=+0.001426
 ```
 
-Cost scales linearly with the number of assets: **8N bump evaluations** for N assets (vs. a flat 8
-in the single-asset case) — 2 for delta/gamma, 2 for vega, 4 for vanna cross-terms, per asset. Only
-the bumped asset's Heston parameters are recalibrated per vol bump (2N recalibrations total, not
-2N × N), but runtime still grows with basket size — a printed line shows the total bump count before
-the computation starts.
+`skew_sens` bumps that asset's own surface with `with_skew_shift()` (see
+[§6.2 Skew sensitivity convention](#skew-sensitivity-convention)), holding every other asset's
+surface — and the correlation matrix — at base. It requires no per-asset performance rescale (like
+vega, not like delta/gamma): a pure skew tilt doesn't touch the asset's spot reference, so there's
+nothing to rescale before taking the worst-of min.
+
+Cost scales linearly with the number of assets: **10N bump evaluations** for N assets (vs. a flat 10
+in the single-asset case) — 2 for delta/gamma, 2 for vega, 2 for skew_sens, 4 for vanna cross-terms,
+per asset. Only the bumped asset's Heston parameters are recalibrated per vol or skew bump (4N
+recalibrations total, not 4N × N), but runtime still grows with basket size — a printed line shows
+the total bump count before the computation starts.
 
 **Barrier convention**: unlike the single-asset Greeks (which rescale the note's barriers to hold
 their absolute dollar level fixed under a spot bump), basket Greeks rescale the **bumped asset's own
