@@ -4,3 +4,7 @@ pandas>=2.0
 matplotlib>=3.7
 jupyter>=1.0
 PyYAML>=6.0
+
+# GUI launcher (gui/app.py) only. The pricer itself has no dependency on this —
+# main.py, run_scenarios.py and diagnostics/ all run without streamlit installed.
+streamlit>=1.30

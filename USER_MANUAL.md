@@ -26,6 +26,7 @@
 10. [Performance Guide](#10-performance-guide)
 11. [Worst-of Basket Pricing](#11-worst-of-basket-pricing)
 12. [Numerical Corrections](#12-numerical-corrections)
+13. [GUI Launcher](#13-gui-launcher)
 
 ---
 
@@ -1209,3 +1210,67 @@ for payoffs that are monotone in the driving randomness.)
 Regression tests for both properties live in `tests/test_models.py`
 (`test_antithetic_halves_are_negatively_correlated`, `test_antithetic_reduces_variance`,
 `test_mc_pricer_standard_error_accounts_for_pairing`).
+
+
+---
+
+## 13. GUI Launcher
+
+A small local UI for the three things you do repeatedly: edit an input file, run a
+command, look at the results.
+
+```bash
+pip install streamlit          # one-off; not needed by the pricer itself
+streamlit run gui/app.py
+```
+
+It opens in your browser (on WSL, your Windows browser — no X server needed).
+
+### What it is, and what it is not
+
+The launcher **shells out to the existing scripts**. It does not import the pricer,
+re-implement any of it, or hold its own copy of any setting. `main.py`,
+`run_scenarios.py` and `diagnostics/model_quality.py` are untouched and remain the
+real interface.
+
+Two things follow from that, both deliberate:
+
+- **A run from the GUI and a run from the shell are the same run.** There is only
+  one code path, so behaviour cannot drift between them. The command being executed
+  is displayed verbatim before you press Run — you can copy it into a terminal and
+  get an identical result.
+- **The pricer does not depend on streamlit.** If it is not installed, everything
+  except `gui/app.py` still works.
+
+### Tabs
+
+| Tab | Does |
+|---|---|
+| **Inputs** | Pick any YAML under `config.yaml`, `configs/` or `scenarios/`; edit it as raw text; save. |
+| **Run** | Choose a script, set its flags, see the exact command, run it with live output. |
+| **Results** | Load any CSV from `results/` or `scenarios/`; prices, model spread and Greeks as tables and charts. |
+
+### Why raw YAML instead of form widgets
+
+`config.yaml` is ~300 lines of heavily commented settings, and the comments are
+most of its value — they explain what each field does and why the defaults are what
+they are. Generated form widgets would strip them on every save, and the form would
+need updating whenever a field is added. The editor validates with `yaml.safe_load`
+on every keystroke and refuses to save anything that would fail later inside a run.
+
+### Notes
+
+- **The page blocks while a command runs**, exactly as a terminal would. Output
+  streams live, so a long run is visibly progressing rather than apparently hung.
+  To abandon a run, Ctrl+C in the terminal that launched Streamlit.
+- **Greeks runs are slow.** Twelve scenarios with `--greeks` is roughly seven
+  minutes with LSV enabled. The UI warns before you start one.
+- **Archived results in `results/` predate LSV** and the Dupire correction in
+  §12. The Results tab detects which models a file actually contains — from its
+  `<model>_se` columns rather than a hardcoded list — and flags older files
+  rather than misreading them.
+- **LSV in the saved deal configs.** The four single-asset configs in `configs/`
+  carry `lsv: true`. The two worst-of basket configs carry `lsv: false`, because
+  there is no `BasketLSVModel` yet — a basket run ignores the key entirely, so
+  setting it `true` there would imply the note was priced under LSV when it was
+  not. See [§11 Worst-of Basket Pricing](#11-worst-of-basket-pricing).
