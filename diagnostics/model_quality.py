@@ -37,6 +37,8 @@ from calibration.calibrators import calibrate_heston, calibrate_sabr
 from models.local_vol import LocalVolModel
 from models.heston import HestonModel, HestonParams
 from models.sabr import SABRModel, SABRParams
+from models.lsv import LSVModel
+from calibration.lsv_calibration import leverage_from_config, lsv_settings
 from engine.black_scholes import bs_price, implied_vol as bs_implied_vol
 from scenarios.run_scenarios import deep_merge
 
@@ -84,10 +86,19 @@ def build_surface(cfg: dict, spot: float, rate: float, div_yield: float):
 
 
 def build_models(cfg: dict, surface, spot: float, rate: float,
-                 div_yield: float, seed: int) -> list[tuple[str, object]]:
-    """Return list of (name, model) for each enabled model."""
+                 div_yield: float, seed: int,
+                 t_max: float = 1.0) -> list[tuple[str, object]]:
+    """
+    Return list of (name, model) for each enabled model.
+
+    t_max : longest maturity that will be priced. Only LSV needs it -- its
+            leverage function is calibrated forward in time and must cover
+            the whole horizon, unlike the other models which are stateless
+            in time.
+    """
     models_cfg = cfg.get("models", {})
     models = []
+    heston_params = None   # reused by LSV, which builds on the same calibration
 
     if models_cfg.get("local_vol", True):
         m = LocalVolModel(surface=surface, steps_per_year=52, seed=seed)
@@ -102,9 +113,27 @@ def build_models(cfg: dict, surface, spot: float, rate: float,
         except Exception as e:
             print(f"failed ({e}), using defaults")
             params = HestonParams()
+        heston_params = params
         m = HestonModel(params=params, spot=spot, rate=rate, div_yield=div_yield,
                         steps_per_year=52, seed=seed)
         models.append(("Heston", m))
+
+    if models_cfg.get("lsv", False):
+        try:
+            print("  Calibrating LSV...", end=" ", flush=True)
+            hp = heston_params
+            if hp is None:
+                hp = calibrate_heston(surface, n_calibration_points=36)
+            leverage = leverage_from_config(cfg, surface, hp, T_max=t_max, seed=seed)
+            lo, hi = leverage.value_range()
+            print(f"L in [{lo:.4f}, {hi:.4f}] over {leverage.n_slices} slices")
+            m = LSVModel(params=hp, leverage=leverage, spot=spot, rate=rate,
+                         div_yield=div_yield,
+                         steps_per_year=int(lsv_settings(cfg)["steps_per_year"]),
+                         seed=seed)
+            models.append(("LSV", m))
+        except Exception as e:
+            print(f"failed ({e}), skipping LSV")
 
     if models_cfg.get("sabr", True):
         try:
@@ -279,13 +308,16 @@ def run_fit_check(
     surface = build_surface(cfg, SPOT, RATE, DIV_YIELD)
     T_min, T_max_surf = surface.maturity_range
 
-    print(f"  Calibrating models for [{label}]...")
-    models = build_models(cfg, surface, SPOT, RATE, DIV_YIELD, SEED)
-    model_names = [name for name, _ in models]
-
+    # Maturities are resolved BEFORE building models: LSV's leverage function
+    # is calibrated forward in time, so it needs to know the horizon up front.
     maturities = [T for T in DEFAULT_MATURITIES if T_min < T <= T_max_surf]
     if not maturities:
         maturities = [T_max_surf]
+
+    print(f"  Calibrating models for [{label}]...")
+    models = build_models(cfg, surface, SPOT, RATE, DIV_YIELD, SEED,
+                          t_max=float(max(maturities)))
+    model_names = [name for name, _ in models]
 
     strikes = SPOT * DEFAULT_MONEYNESS
 

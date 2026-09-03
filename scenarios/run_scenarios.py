@@ -30,7 +30,9 @@ from calibration.calibrators import calibrate_heston, calibrate_sabr
 from models.local_vol import LocalVolModel
 from models.heston import HestonModel, HestonParams
 from models.sabr import SABRModel, SABRParams
+from models.lsv import LSVModel
 from models.basket import BasketLocalVolModel, BasketHestonModel, BasketHestonAsset
+from calibration.lsv_calibration import leverage_from_config, lsv_settings
 from products.autocallable import AutocallableNote
 from engine.mc_pricer import MCPricer
 
@@ -77,17 +79,24 @@ def build_surface(cfg: dict, spot: float, rate: float, div_yield: float):
 def calibrate_all(
     cfg: dict,
     surface,
+    T_max: float = 3.0,
     verbose: bool = False,
     fast: bool = False,
     warm_start: dict | None = None,
+    seed: int | None = None,
 ) -> dict:
     """
-    Calibrate Heston and SABR on `surface`.
+    Calibrate Heston, LSV and SABR on `surface`.
     Returns {model_name: params} for each enabled SV model.
     LocalVol needs no calibration (reads Dupire vols directly from surface).
 
-    fast       : use relaxed convergence tolerances (for Greek FD bumps)
+    T_max      : longest maturity to be priced. Only LSV uses it -- its
+                 leverage function is built forward in time and must span the
+                 whole horizon. Heston and SABR are stateless in time.
+    fast       : use relaxed convergence tolerances, and fewer LSV particles
+                 (for Greek FD bumps)
     warm_start : {model_name: params} to use as starting point (speeds up fast mode)
+    seed       : RNG seed for the LSV particle calibration
     """
     models_cfg = cfg.get("models", {})
     cal: dict = {}
@@ -105,6 +114,28 @@ def calibrate_all(
             params = HestonParams() if init is None else init
         cal["Heston"] = params
 
+    if models_cfg.get("lsv", False):
+        # LSV is stored as (heston_params, leverage_function): the pair is only
+        # valid together, since the leverage was calibrated against those exact
+        # Heston parameters.
+        warm = (warm_start or {}).get("LSV")
+        hp = cal.get("Heston")
+        if hp is None:
+            # Heston itself disabled -- LSV still needs its stochastic-vol leg.
+            try:
+                hp = calibrate_heston(
+                    surface, initial_params=warm[0] if warm else None, fast=fast
+                )
+            except Exception:
+                hp = HestonParams()
+        try:
+            lev = leverage_from_config(cfg, surface, hp, T_max=T_max,
+                                       seed=seed, fast=fast, verbose=verbose)
+            cal["LSV"] = (hp, lev)
+        except Exception as e:
+            if verbose:
+                print(f"    LSV leverage calibration failed ({e}), skipping LSV")
+
     if models_cfg.get("sabr", True):
         try:
             params = calibrate_sabr(surface, beta=1.0, calibration_maturity=1.0)
@@ -118,6 +149,27 @@ def calibrate_all(
         cal["SABR"] = params
 
     return cal
+
+
+def relever(cfg: dict, base_cal: dict, surface, T_max: float,
+            seed: int | None = None) -> dict:
+    """
+    Recalibrate ONLY the LSV leverage function against `surface`, keeping every
+    other calibrated parameter -- including LSV's own Heston leg -- from
+    `base_cal`.
+
+    Used for spot-bump Greeks when sticky_leverage is off. Going through
+    calibrate_all() there would also re-fit Heston and SABR on the bumped
+    surface, silently changing THEIR delta convention as a side effect of an
+    LSV setting.
+    """
+    if "LSV" not in base_cal:
+        return base_cal
+    hp, _ = base_cal["LSV"]
+    out = dict(base_cal)
+    out["LSV"] = (hp, leverage_from_config(cfg, surface, hp, T_max=T_max,
+                                           seed=seed, fast=True))
+    return out
 
 
 def build_pricers(cfg: dict, surface, spot: float, rate: float,
@@ -148,6 +200,18 @@ def build_pricers(cfg: dict, surface, spot: float, rate: float,
         m = HestonModel(params=params, spot=spot, rate=rate, div_yield=div_yield,
                         steps_per_year=52, seed=seed)
         pricers.append(MCPricer(m, "Heston", antithetic))
+
+    if models_cfg.get("lsv", False):
+        # LSV cannot be built without a pre-calibrated leverage function: it
+        # depends on the pricing horizon, which build_pricers does not know.
+        entry = (calibrated_params or {}).get("LSV")
+        if entry is not None:
+            hp, lev = entry
+            m = LSVModel(params=hp, leverage=lev, spot=spot, rate=rate,
+                         div_yield=div_yield,
+                         steps_per_year=int(lsv_settings(cfg)["steps_per_year"]),
+                         seed=seed)
+            pricers.append(MCPricer(m, "LSV", antithetic))
 
     if models_cfg.get("sabr", True):
         if calibrated_params and "SABR" in calibrated_params:
@@ -419,11 +483,36 @@ def compute_greeks(
     s_up_vdn = s_vdn.with_spot(SPOT + h_S)
     s_dn_vdn = s_vdn.with_spot(SPOT - h_S)
 
+    T_max = float(product.maturity)
+
     # Re-calibrate SV models for vol- and skew-bumped surfaces (fast warm-start).
-    cal_vup  = calibrate_all(cfg, s_vup,  fast=True, warm_start=base_cal)
-    cal_vdn  = calibrate_all(cfg, s_vdn,  fast=True, warm_start=base_cal)
-    cal_skup = calibrate_all(cfg, s_skup, fast=True, warm_start=base_cal)
-    cal_skdn = calibrate_all(cfg, s_skdn, fast=True, warm_start=base_cal)
+    cal_vup  = calibrate_all(cfg, s_vup,  T_max, fast=True, warm_start=base_cal, seed=seed)
+    cal_vdn  = calibrate_all(cfg, s_vdn,  T_max, fast=True, warm_start=base_cal, seed=seed)
+    cal_skup = calibrate_all(cfg, s_skup, T_max, fast=True, warm_start=base_cal, seed=seed)
+    cal_skdn = calibrate_all(cfg, s_skdn, T_max, fast=True, warm_start=base_cal, seed=seed)
+
+    # --- LSV leverage under spot bumps: the delta convention (config D1) -----
+    # sticky_leverage=True holds L(t,S) fixed as spot moves, so the spot bumps
+    # reuse the base leverage. That is a modelling choice, not just a speed
+    # optimisation -- it defines what LSV delta MEANS -- but it also removes
+    # six particle calibrations per scenario, which is most of the cost of
+    # putting LSV in the Greeks path at all.
+    #
+    # When it is off we re-lever via relever() rather than calibrate_all(), so
+    # that Heston's and SABR's own parameters stay frozen across spot bumps and
+    # their deltas are unaffected by an LSV setting.
+    sticky = bool(lsv_settings(cfg).get("sticky_leverage", True))
+    if sticky:
+        cal_up, cal_dn = base_cal, base_cal
+        cal_up_vup, cal_dn_vup = cal_vup, cal_vup
+        cal_up_vdn, cal_dn_vdn = cal_vdn, cal_vdn
+    else:
+        cal_up     = relever(cfg, base_cal, s_up,     T_max, seed)
+        cal_dn     = relever(cfg, base_cal, s_dn,     T_max, seed)
+        cal_up_vup = relever(cfg, cal_vup,  s_up_vup, T_max, seed)
+        cal_dn_vup = relever(cfg, cal_vup,  s_dn_vup, T_max, seed)
+        cal_up_vdn = relever(cfg, cal_vdn,  s_up_vdn, T_max, seed)
+        cal_dn_vdn = relever(cfg, cal_vdn,  s_dn_vdn, T_max, seed)
 
     def price_all(surface, spot, cal, prod) -> dict[str, float]:
         pricers = build_pricers(cfg, surface, spot, RATE, DIV_YIELD,
@@ -432,16 +521,16 @@ def compute_greeks(
 
     # Bumped price evaluations (CRN via shared seed).
     # Spot-bumped calls use rescaled products; vol/skew-only calls use the original.
-    P_up     = price_all(s_up,     SPOT + h_S, base_cal, product_up)
-    P_dn     = price_all(s_dn,     SPOT - h_S, base_cal, product_dn)
+    P_up     = price_all(s_up,     SPOT + h_S, cal_up, product_up)
+    P_dn     = price_all(s_dn,     SPOT - h_S, cal_dn, product_dn)
     P_vup    = price_all(s_vup,    SPOT,        cal_vup,  product)
     P_vdn    = price_all(s_vdn,    SPOT,        cal_vdn,  product)
     P_skup   = price_all(s_skup,   SPOT,        cal_skup, product)
     P_skdn   = price_all(s_skdn,   SPOT,        cal_skdn, product)
-    P_up_vup = price_all(s_up_vup, SPOT + h_S,  cal_vup,  product_up)
-    P_dn_vup = price_all(s_dn_vup, SPOT - h_S,  cal_vup,  product_dn)
-    P_up_vdn = price_all(s_up_vdn, SPOT + h_S,  cal_vdn,  product_up)
-    P_dn_vdn = price_all(s_dn_vdn, SPOT - h_S,  cal_vdn,  product_dn)
+    P_up_vup = price_all(s_up_vup, SPOT + h_S,  cal_up_vup, product_up)
+    P_dn_vup = price_all(s_dn_vup, SPOT - h_S,  cal_dn_vup, product_dn)
+    P_up_vdn = price_all(s_up_vdn, SPOT + h_S,  cal_up_vdn, product_up)
+    P_dn_vdn = price_all(s_dn_vdn, SPOT - h_S,  cal_dn_vdn, product_dn)
 
     greeks: dict[str, GreekResult] = {}
     for name in P_up:
@@ -711,12 +800,15 @@ def run_all(
 
             surface = build_surface(cfg, SPOT, RATE, DIV_YIELD)
 
+            # Product first: LSV's leverage calibration needs the horizon.
+            product = build_product(cfg, SPOT, RATE)
+
             # Calibrate SV models once; reuse params for spot-bump Greeks
-            base_cal = calibrate_all(cfg, surface, verbose=verbose)
+            base_cal = calibrate_all(cfg, surface, float(product.maturity),
+                                     verbose=verbose, seed=seed)
 
             pricers = build_pricers(cfg, surface, SPOT, RATE, DIV_YIELD,
                                     seed, antithetic, calibrated_params=base_cal)
-            product = build_product(cfg, SPOT, RATE)
 
             prices, ses, durations = {}, {}, {}
             for pricer in pricers:
