@@ -23,7 +23,9 @@ from calibration.calibrators import calibrate_heston, calibrate_sabr
 from models.local_vol import LocalVolModel
 from models.heston import HestonModel, HestonParams
 from models.sabr import SABRModel, SABRParams
+from models.lsv import LSVModel
 from models.basket import BasketLocalVolModel, BasketHestonModel, BasketHestonAsset
+from calibration.lsv_calibration import leverage_from_config, lsv_settings
 from products.autocallable import AutocallableNote
 from engine.mc_pricer import MCPricer, compare_models
 from engine.heston_cf import heston_price_batch
@@ -301,6 +303,33 @@ def main():
             heston_model = HestonModel(params=heston_params, spot=SPOT, rate=RATE,
                                        div_yield=DIV_YIELD, steps_per_year=52, seed=SEED)
             pricers.append(MCPricer(heston_model, model_name="Heston SV", antithetic=ANTITHETIC))
+
+        if models_cfg.get("lsv", False):
+            # LSV builds on the Heston calibration; do it here if Heston
+            # itself is disabled so the model can still be used standalone.
+            if heston_params is None:
+                try:
+                    print("Calibrating Heston (required by LSV)...")
+                    heston_params = calibrate_heston(surface, n_calibration_points=36)
+                except Exception as e:
+                    print(f"  Calibration failed ({e}), using default params.")
+                    heston_params = HestonParams()
+            try:
+                print("Calibrating LSV leverage function (particle method)...")
+                leverage = leverage_from_config(
+                    cfg, surface, heston_params, T_max=float(product.maturity),
+                    seed=SEED, verbose=True,
+                )
+                lsv_model = LSVModel(
+                    params=heston_params, leverage=leverage, spot=SPOT, rate=RATE,
+                    div_yield=DIV_YIELD,
+                    steps_per_year=int(lsv_settings(cfg)["steps_per_year"]),
+                    seed=SEED,
+                )
+                pricers.append(MCPricer(lsv_model, model_name="Heston-LSV",
+                                        antithetic=ANTITHETIC))
+            except Exception as e:
+                print(f"  LSV leverage calibration failed ({e}); skipping LSV.")
 
         if models_cfg.get("sabr", True):
             try:

@@ -25,25 +25,66 @@
 9. [Running the Tests](#9-running-the-tests)
 10. [Performance Guide](#10-performance-guide)
 11. [Worst-of Basket Pricing](#11-worst-of-basket-pricing)
+12. [Numerical Corrections](#12-numerical-corrections)
+
+---
+
+> ### ⚠ Prices have shifted since the LSV release
+>
+> Two numerical defects were found and fixed while adding LSV. **Results produced before that
+> change are not directly comparable to results produced after it.** Both are documented in
+> [§12 Numerical Corrections](#12-numerical-corrections):
+>
+> - **Dupire local vol** was computed with `∂w/∂T` taken at fixed strike where the formula
+>   requires fixed log-moneyness. This biased every skewed-surface price. Local Vol's vanilla
+>   round-trip improved from ~21bp RMS to ~2bp once corrected.
+> - **Antithetic variates were not antithetic** in any model — the mirror half drew fresh
+>   random numbers instead of reusing the partner's. Prices were unbiased, but the advertised
+>   variance reduction was absent and reported standard errors were too wide.
+>
+> Regenerate any saved `results.csv` you intend to rely on.
 
 ---
 
 ## 1. Overview
 
-This tool prices autocallable structured notes (FCN, EKI, Phoenix, Snowball variants) under three
+This tool prices autocallable structured notes (FCN, EKI, Phoenix, Snowball variants) under four
 volatility models simultaneously and reports the **model spread** — the price difference arising
 solely from the choice of dynamics — as a measure of model risk.
 
-### Three models
+### Four models
 
 | Model | Dynamics | Surface fit | Typical use |
 |-------|----------|-------------|-------------|
 | **Local Vol** (Dupire) | Deterministic σ(t, S) derived from market vols via Dupire's formula | Exact by construction | Model risk lower bound; conservative barrier pricing |
 | **Heston SV** | Mean-reverting stochastic variance (CIR process); spot-vol correlation ρ | Global fit over all maturities and strikes | Captures forward skew dynamics; well-suited for long-dated autocalls |
+| **Heston-LSV** | Heston, with a leverage function L(t, S) on the spot diffusion | Near-exact — matches Local Vol, ~2× better than Heston | **The production choice.** Exact surface fit *and* realistic forward dynamics |
 | **SABR SV** | Log-normal stochastic vol; backbone β = 1 | Calibrated to a single maturity slice (default: 1y) | **Disabled by default.** See note below. |
 
-All three are calibrated to the same implied vol surface, so differences in price are not due to a vol
+All are calibrated to the same implied vol surface, so differences in price are not due to a vol
 level mismatch — they reflect genuine disagreement about the joint distribution of path and final payoff.
+
+> **Why LSV matters for autocallables**: an autocall is a sequence of barrier decisions on future
+> dates, so its price depends both on today's smile (which fixes the barrier levels) and on how
+> that smile evolves (which fixes the crossing probabilities). Local Vol gets the first right and
+> the second wrong — its forward smile flattens and vol-of-vol is zero. Heston gets the second
+> right but, with only five parameters, leaves a smile residual that is an uncontrolled
+> mispricing of the barriers. LSV multiplies the Heston diffusion by a deterministic leverage
+> function
+>
+> ```
+> L(t, S)² = σ_LV(t, S)² / E[ V_t | S_t = S ]
+> ```
+>
+> chosen so the model reprices the whole vanilla surface while (κ, θ, ξ, ρ, v₀) continue to carry
+> the forward dynamics. On the default config surface, measured over 0.25–3y and ±20% moneyness:
+> Local Vol 11.7bp RMS, **LSV 12.8bp**, Heston 27.4bp. LSV buys Heston's dynamics at essentially
+> Local Vol's fit quality.
+>
+> The leverage function is calibrated by the **particle method** (Guyon & Henry-Labordère, 2011):
+> an ensemble of particles is walked forward, and at each time slice the conditional expectation
+> `E[V|S]` is estimated by averaging variance within equal-count spot bins. Cost is roughly one
+> second per surface at 50k particles. See `calibration/lsv_calibration.py`.
 
 > **Why SABR is disabled by default**: SABR's single `alpha` parameter produces a nearly flat ATM
 > vol term structure, but equity surfaces have an exponential ATM decay (high short-term vol
@@ -87,13 +128,13 @@ pip install numpy scipy pyyaml matplotlib pytest
 python main.py --no-fit-check
 ```
 
-A successful run prints calibrated model parameters followed by three pricing lines.
+A successful run prints calibrated model parameters followed by one pricing line per enabled model.
 
 ---
 
 ## 3. Quick Start
 
-Price the note defined in `config.yaml` under all three models:
+Price the note defined in `config.yaml` under all enabled models:
 
 ```bash
 python main.py
@@ -290,12 +331,46 @@ capital only if the stock finishes more than 40% below its initial level).
 models:
   local_vol: true   # recommended
   heston:    true   # recommended
+  lsv:       true   # recommended — best surface fit with realistic dynamics
   sabr:      false  # disabled by default — see Section 1 for rationale
 ```
 
 Set any to `false` to skip that model. Running with only one model is faster and useful for
 sensitivity testing. SABR can be re-enabled for research or comparison runs, but its prices
 should not be used for production autocallable risk management.
+
+LSV builds on the Heston calibration, so enabling `lsv` triggers a Heston fit even when
+`heston: false` — you can price LSV without also reporting plain Heston.
+
+#### LSV leverage calibration settings
+
+```yaml
+lsv:
+  n_particles: 50000      # ensemble size for E[V|S]
+  n_spot_bins: 28         # spot nodes per time slice
+  leverage_cap: [0.1, 10.0]
+  steps_per_year: 52      # should match the simulation grid
+  sticky_leverage: true   # see below — affects LSV delta
+```
+
+| Setting | Effect |
+|---|---|
+| `n_particles` | Accuracy plateaus around 10–50k. Beyond that the residual is time discretisation, not particle noise, so raising it further buys nothing. |
+| `n_spot_bins` | Particles are split into equal-**count** bins, so bins can never be empty and the wings cannot produce a spurious leverage spike. 25–30 is the usual tradeoff. |
+| `leverage_cap` | A safety rail, not a tuning knob: in sparse wings `E[V|S]` can collapse toward zero and send L to infinity. If the cap binds anywhere but the extreme wings, the calibration is unhealthy. Run with `--verbose` to see `clipped_fraction`. |
+| `steps_per_year` | Raising both this and the simulation grid to 104 tightens the vanilla round-trip from ~6bp to ~4bp RMS, at roughly double the calibration cost. |
+| `sticky_leverage` | **Changes what LSV delta means** — see below. |
+
+> **`sticky_leverage` is a modelling choice, not just an optimisation.** When `true` (the
+> default), the leverage surface is held fixed as spot is bumped for delta and gamma, so the
+> spot-bumped repricings reuse the base leverage function. When `false`, the leverage is
+> recalibrated on every bumped surface — six extra particle calibrations per scenario, and a
+> different (larger) delta. Vega and skew sensitivity always recalibrate, in both settings,
+> because a vol bump changes the surface the leverage is defined against.
+>
+> Turning it off does **not** affect Local Vol, Heston or SABR deltas: the re-levering path
+> deliberately holds their parameters frozen so that an LSV setting cannot change another
+> model's reported risk.
 
 ---
 
@@ -1055,3 +1130,82 @@ single fraction shared across whichever asset is currently worst — it can't be
 the way a single-asset barrier can. The two approaches are mathematically equivalent; this
 distinction matters in practice because Heston's simulated performance is scale-invariant to the
 spot level, so without this rescale, Heston's basket delta/gamma would come out as exactly zero.
+
+---
+
+## 12. Numerical Corrections
+
+Two defects were found while adding the LSV model. Both predate it and affected all models.
+Neither was a modelling choice — both were implementation errors with measurable consequences.
+
+### 12.1 Dupire local volatility: `∂w/∂T` taken at the wrong constant
+
+**What was wrong.** `ImpliedVolSurface.local_variance()` implements Dupire's formula in Gatheral's
+log-moneyness parameterisation:
+
+```
+σ_LV² = (∂w/∂T) / [1 − (y/w)·∂w/∂y + ¼(−¼ − 1/w + y²/w²)(∂w/∂y)² + ½·∂²w/∂y²]
+```
+
+where `w = σ_imp²·T` and `y = ln(K/F(T))`. Every derivative in that expression is with respect to
+`(T, y)`. The code computed `∂w/∂T` by bumping `T` at **fixed strike K**. Because `F(T)` drifts
+with `T`, holding `K` fixed does not hold `y` fixed, and the two derivatives differ by
+
+```
+∂w/∂T|_K  −  ∂w/∂T|_y  =  −(r − q) · ∂w/∂y
+```
+
+**Why it went unnoticed.** The error term is proportional to `∂w/∂y`, the skew. On a **flat**
+surface it is identically zero — so every flat-surface test passed, and the flat-surface
+round-trip was accurate to ~1bp. It only bites when there is skew, which is to say on every
+realistic surface.
+
+**Impact.** With `r − q = 2%` on the default config surface, local vol was overstated by ~1.3%
+relative, and Local Vol's own vanilla round-trip carried a **+21bp RMS** bias — a bias that did
+not shrink with more timesteps, a finer surface grid, or a smaller finite-difference step,
+because it was in the formula rather than the numerics.
+
+**The fix.** Shift the strike with the forward so `y` is held constant:
+
+```python
+K_T_up = K * self.forward(T + dT) / F
+K_T_dn = K * self.forward(T - dT) / F
+dw_dT  = (self.total_variance(T + dT, K_T_up)
+          - self.total_variance(T - dT, K_T_dn)) / (2 * dT)
+```
+
+In the vectorised `local_vol_batch()` the same correction is a shift of the spline coordinate by
+`(r − q)·dT`. Local Vol's round-trip improved from **21bp RMS to 2.1bp**; the flat-surface control
+was unchanged, as expected.
+
+### 12.2 Antithetic variates were not antithetic
+
+**What was wrong.** A true antithetic pair reuses the **same** random draws with the sign flipped.
+All five models (`local_vol`, `heston`, `sabr`, and both basket models) instead generated the
+second half of the ensemble from **fresh** draws and negated those:
+
+```python
+Z = anti_sign * self.rng.standard_normal(n)   # drawn again for the mirror pass
+```
+
+Negating a fresh standard normal yields another independent standard normal — the law is
+symmetric — so the "antithetic" half was statistically independent of the original.
+
+**Impact.** Prices were **unbiased and remain correct**; nothing previously computed was wrong in
+expectation. What was lost was the variance reduction: `antithetic=True` bought nothing, and
+reported standard errors and confidence intervals were wider than they should have been.
+
+**The fix.** All models now simulate both halves in a **single pass**, with paths `[half:]` the
+literal mirror of paths `[:half]`: the same normals negated, and — for the QE variance scheme —
+the same uniforms reflected as `U → 1−U`. `MCPricer` was also updated: the standard error is now
+computed by averaging each antithetic pair into one observation, because treating the paths as
+independent ignores their negative covariance and discards the improvement on paper.
+
+Measured on the default note: standard error improved **1.11–1.23×** for single-asset and basket
+models, and 1.24–1.45× on a vanilla call. (The autocall gains less because its payoff is a sum of
+digital barrier events rather than monotone in terminal spot, and antithetic variates only help
+for payoffs that are monotone in the driving randomness.)
+
+Regression tests for both properties live in `tests/test_models.py`
+(`test_antithetic_halves_are_negatively_correlated`, `test_antithetic_reduces_variance`,
+`test_mc_pricer_standard_error_accounts_for_pairing`).

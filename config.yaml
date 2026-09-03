@@ -240,7 +240,54 @@ product:
 #   for multi-date path-dependent products.
 #   Set sabr: true only for research / model comparison purposes.
 #
+# Heston-LSV (Stochastic Local Volatility):
+#   Heston dynamics with a deterministic leverage function L(t,S) multiplying
+#   the spot diffusion:
+#       dS/S = (r-q) dt + L(t,S) * sqrt(V) dW_S
+#   L is calibrated so the model reprices the whole vanilla surface, via
+#       L(t,S)^2 = sigma_LV(t,S)^2 / E[V_t | S_t = S]
+#   This gets both properties an autocallable needs at once: Dupire's exact
+#   surface fit AND Heston's realistic forward smile dynamics. Plain Heston
+#   leaves a smile residual that is an uncontrolled mispricing of the barrier
+#   levels; plain local vol fits the surface but has a degenerate forward
+#   smile. LSV is the standard production model for these products.
+#
+#   Requires the Heston calibration as its starting point, so enabling LSV
+#   implies a Heston calibration even when `heston:` itself is false.
+#   Costs one particle-method calibration per surface (~1s at 50k particles).
+#
 models:
   local_vol: true   # Dupire Local Volatility
   heston: true      # Heston Stochastic Volatility
+  lsv: true         # Heston Stochastic Local Volatility (see note above)
   sabr: false       # SABR — disabled by default (see note above)
+
+# ── LSV leverage calibration settings ─────────────────────────────────────────
+# Only used when models.lsv is true.
+lsv:
+  # Particle ensemble size for the conditional expectation E[V|S].
+  # Accuracy plateaus around 10-50k; beyond that the residual is dominated by
+  # time discretisation, not particle noise.
+  n_particles: 50000
+
+  # Spot nodes per time slice. Particles are split into equal-COUNT bins, so
+  # bins can never be empty and the wings cannot produce a spurious spike.
+  # 25-30 is the usual accuracy/smoothness tradeoff.
+  n_spot_bins: 28
+
+  # Hard bounds on L. A safety rail, not a tuning knob: in sparse wings the
+  # denominator E[V|S] can collapse toward zero and send L to infinity.
+  # If these bind anywhere but the extreme wings, the calibration is unhealthy.
+  leverage_cap: [0.1, 10.0]
+
+  # Calibration time resolution. Should match the simulation steps_per_year
+  # (52). Raising both to 104 tightens the vanilla round-trip from roughly
+  # 6bp to 4bp RMS, at roughly double the calibration cost.
+  steps_per_year: 52
+
+  # Reuse the base leverage function for SPOT-bumped Greek evaluations instead
+  # of recalibrating for each bump. This is a modelling choice, not just an
+  # optimisation: it holds the leverage surface fixed as spot moves, which
+  # defines the delta convention. It roughly halves --greeks runtime.
+  # Set false to recalibrate on every bump (slower, different delta).
+  sticky_leverage: true
