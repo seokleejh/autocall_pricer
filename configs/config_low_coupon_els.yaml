@@ -244,4 +244,5 @@ product:
 models:
   local_vol: true   # Dupire Local Volatility
   heston: true      # Heston Stochastic Volatility
+  lsv: true         # Heston Stochastic Local Volatility (exact surface fit + SV dynamics)
   sabr: false       # SABR — disabled by default (see note above)

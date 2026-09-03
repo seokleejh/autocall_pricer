@@ -101,4 +101,5 @@ models:
   local_vol: true   # Basket Local Vol (correlated Dupire, exact correlation recovery)
   heston: true       # Basket Heston (correlated spot Brownians; see models/basket.py
                      # for the approximate nature of correlation recovery here)
+  lsv: false         # not supported for basket pricing (single-asset only)
   sabr: false        # not supported for basket pricing
