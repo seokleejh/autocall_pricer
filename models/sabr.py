@@ -115,16 +115,29 @@ class SABRModel:
         obs = np.asarray(observation_times, dtype=float)
         t_grid = self._build_time_grid(obs)
 
-        half = n_paths // 2 if antithetic else n_paths
-        perf1 = self._simulate_batch(half, obs, t_grid, sign=1)
         if antithetic:
-            perf2 = self._simulate_batch(half, obs, t_grid, sign=-1)
-            return np.vstack([perf1, perf2])[:n_paths]
-        return perf1
+            half = n_paths // 2
+            n_sim = 2 * half
+        else:
+            half = 0
+            n_sim = n_paths
 
-    def _simulate_batch(
-        self, n: int, obs: np.ndarray, t_grid: np.ndarray, sign: int
+        perf = self._simulate_ensemble(n_sim, half, obs, t_grid, antithetic)
+        return perf[:n_paths]
+
+    def _simulate_ensemble(
+        self, n: int, half: int, obs: np.ndarray, t_grid: np.ndarray,
+        antithetic: bool,
     ) -> np.ndarray:
+        """
+        Simulate the whole ensemble in a single pass.
+
+        When `antithetic` is set, paths [half:] mirror paths [:half] by
+        reusing the SAME normal draws with the sign flipped -- both drivers,
+        so the rho correlation survives the reflection intact. Drawing fresh
+        normals for the mirror half and negating them would give independent
+        paths (the normal law is symmetric) and no variance reduction.
+        """
         p = self.params
         r, q = self.rate, self.div_yield
 
@@ -142,9 +155,15 @@ class SABRModel:
 
             alpha = np.exp(log_alpha)
 
-            # Correlated Brownians
-            Z1 = sign * self.rng.standard_normal(n)
-            Z2_ind = self.rng.standard_normal(n)
+            # Correlated Brownians, mirrored across the antithetic halves
+            if antithetic:
+                z1 = self.rng.standard_normal(half)
+                z2 = self.rng.standard_normal(half)
+                Z1     = np.concatenate([z1, -z1])
+                Z2_ind = np.concatenate([z2, -z2])
+            else:
+                Z1     = self.rng.standard_normal(n)
+                Z2_ind = self.rng.standard_normal(n)
             Z2 = p.rho * Z1 + np.sqrt(1 - p.rho**2) * Z2_ind
 
             # SABR forward dynamics

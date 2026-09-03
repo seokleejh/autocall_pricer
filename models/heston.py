@@ -83,19 +83,35 @@ class HestonModel:
         obs = np.asarray(observation_times, dtype=float)
         t_grid = self._build_time_grid(obs)
 
-        half = n_paths // 2 if antithetic else n_paths
-        perf1 = self._simulate_batch(half, obs, t_grid, anti_sign=1)
         if antithetic:
-            perf2 = self._simulate_batch(half, obs, t_grid, anti_sign=-1)
-            return np.vstack([perf1, perf2])[:n_paths]
-        return perf1
+            half = n_paths // 2
+            n_sim = 2 * half
+        else:
+            half = 0
+            n_sim = n_paths
 
-    def _simulate_batch(
-        self, n: int, obs: np.ndarray, t_grid: np.ndarray, anti_sign: int
+        perf = self._simulate_ensemble(n_sim, half, obs, t_grid, antithetic)
+        return perf[:n_paths]
+
+    def _simulate_ensemble(
+        self, n: int, half: int, obs: np.ndarray, t_grid: np.ndarray,
+        antithetic: bool,
     ) -> np.ndarray:
+        """
+        Simulate the whole ensemble in a single pass.
+
+        When `antithetic` is set, paths [half:] are the exact mirror of paths
+        [:half]: the SAME normal draws with the sign flipped, and the SAME
+        uniform draws reflected as U -> 1-U so the QE chi-squared branch is
+        antitheticised too.
+
+        Both halves must be advanced together for this to work. Drawing fresh
+        randoms for the mirror half and negating them yields statistically
+        independent paths -- the normal law is symmetric about 0 and the
+        uniform about 1/2 -- and therefore no variance reduction at all.
+        """
         p = self.params
         r, q = self.rate, self.div_yield
-        S0 = self.spot
 
         log_S = np.zeros(n)           # log(S/S0)
         V = np.full(n, p.v0)
@@ -107,14 +123,25 @@ class HestonModel:
         for t_next in t_grid:
             dt = t_next - t_prev
 
-            # Draw both Brownians with anti_sign so the antithetic path fully
-            # negates Z_S = rho*Z_V + sqrt(1-rho^2)*Z_perp.
-            Z_V    = anti_sign * self.rng.standard_normal(n)
-            Z_perp = anti_sign * self.rng.standard_normal(n)
-            Z_S    = p.rho * Z_V + np.sqrt(1.0 - p.rho ** 2) * Z_perp
+            # Mirror both Brownians so Z_S = rho*Z_V + sqrt(1-rho^2)*Z_perp
+            # is itself exactly negated on the antithetic half, and reflect
+            # the uniforms for the QE chi-squared branch.
+            if antithetic:
+                z_v    = self.rng.standard_normal(half)
+                z_perp = self.rng.standard_normal(half)
+                u      = self.rng.uniform(size=half)
+                Z_V    = np.concatenate([z_v, -z_v])
+                Z_perp = np.concatenate([z_perp, -z_perp])
+                U      = np.concatenate([u, 1.0 - u])
+            else:
+                Z_V    = self.rng.standard_normal(n)
+                Z_perp = self.rng.standard_normal(n)
+                U      = self.rng.uniform(size=n)
 
-            # --- QE scheme for variance (uses Z_V and anti_sign) ---
-            V_new = self._qe_step(V, dt, Z_V, anti_sign)
+            Z_S = p.rho * Z_V + np.sqrt(1.0 - p.rho ** 2) * Z_perp
+
+            # --- QE scheme for variance ---
+            V_new = self._qe_step(V, dt, Z_V, U)
 
             # --- Euler step for log S ---
             log_S += (r - q - 0.5 * V) * dt + np.sqrt(V * dt) * Z_S
@@ -130,51 +157,9 @@ class HestonModel:
         return performances
 
     def _qe_step(self, V: np.ndarray, dt: float, Z_V: np.ndarray,
-                 anti_sign: int = 1) -> np.ndarray:
-        """
-        Andersen (2007) QE discretisation of CIR variance process.
-
-        Z_V      : pre-drawn N(0,1) array (already multiplied by anti_sign),
-                   shared with the spot equation to enforce rho correlation
-                   in the exponential branch.
-        anti_sign: +1 for original paths, -1 for antithetic. Used to flip
-                   the uniform draw U → (1-U) in the chi-squared branch so
-                   that both branches are fully antitheticised.
-        """
-        p = self.params
-        kappa, theta, xi = p.kappa, p.theta, p.xi
-        n = len(V)
-
-        e_kdt = np.exp(-kappa * dt)
-        m = theta + (V - theta) * e_kdt
-        s2 = (
-            V * xi**2 * e_kdt / kappa * (1 - e_kdt)
-            + theta * xi**2 / (2 * kappa) * (1 - e_kdt)**2
-        )
-        psi = s2 / (m**2 + 1e-12)
-
-        V_new = np.empty_like(V)
-
-        # QE: use exponential for psi <= psi_c, and shifted chi-squared for psi > psi_c
-        psi_c = 1.5
-        mask_exp = psi <= psi_c
-        mask_chi = ~mask_exp
-
-        # Exponential branch — uses the shared Z_V to preserve rho correlation
-        if mask_exp.any():
-            b2 = 2 / psi[mask_exp] - 1 + np.sqrt(2 / psi[mask_exp]) * np.sqrt(2 / psi[mask_exp] - 1)
-            a = m[mask_exp] / (1 + b2)
-            V_new[mask_exp] = a * (np.sqrt(b2) + Z_V[mask_exp]) ** 2
-
-        # Chi-squared branch — antithetic: flip U → (1-U) for anti_sign=-1
-        if mask_chi.any():
-            p_prob = (psi[mask_chi] - 1) / (psi[mask_chi] + 1)
-            beta = (1 - p_prob) / m[mask_chi]
-            U_raw = self.rng.uniform(size=mask_chi.sum())
-            U = U_raw if anti_sign == 1 else 1.0 - U_raw
-            V_new[mask_chi] = np.where(U <= p_prob, 0.0, np.log((1 - p_prob) / (1 - U)) / beta)
-
-        return np.maximum(V_new, 0.0)
+                 U: np.ndarray) -> np.ndarray:
+        """Andersen QE step using this model's own parameters."""
+        return qe_step(V, dt, Z_V, U, self.params)
 
     def _build_time_grid(self, obs: np.ndarray) -> np.ndarray:
         points = set()
@@ -185,3 +170,55 @@ class HestonModel:
             points.update(sub.tolist())
             t_prev = t
         return np.array(sorted(points))
+
+
+def qe_step(V: np.ndarray, dt: float, Z_V: np.ndarray,
+            U: np.ndarray, params: HestonParams) -> np.ndarray:
+    """
+    Andersen (2007) QE discretisation of the CIR variance process.
+
+    Module-level so the LSV model can reuse it verbatim: LSV shares Heston's
+    variance dynamics exactly and differs only in the spot equation, which
+    gains the leverage factor L(t,S).
+
+    Z_V : pre-drawn N(0,1) array, shared with the spot equation so the
+          exponential branch carries the rho correlation.
+    U   : pre-drawn U(0,1) array, one per path, consumed by the shifted
+          chi-squared branch. Supplied by the caller rather than drawn here
+          so the antithetic half can be handed the reflected uniforms 1-U;
+          drawing internally would also break the pairing, since the two
+          halves select different subsets of paths into this branch.
+    """
+    kappa, theta, xi = params.kappa, params.theta, params.xi
+
+    e_kdt = np.exp(-kappa * dt)
+    m = theta + (V - theta) * e_kdt
+    s2 = (
+        V * xi**2 * e_kdt / kappa * (1 - e_kdt)
+        + theta * xi**2 / (2 * kappa) * (1 - e_kdt)**2
+    )
+    psi = s2 / (m**2 + 1e-12)
+
+    V_new = np.empty_like(V)
+
+    # QE: use exponential for psi <= psi_c, and shifted chi-squared for psi > psi_c
+    psi_c = 1.5
+    mask_exp = psi <= psi_c
+    mask_chi = ~mask_exp
+
+    # Exponential branch — uses the shared Z_V to preserve rho correlation
+    if mask_exp.any():
+        b2 = 2 / psi[mask_exp] - 1 + np.sqrt(2 / psi[mask_exp]) * np.sqrt(2 / psi[mask_exp] - 1)
+        a = m[mask_exp] / (1 + b2)
+        V_new[mask_exp] = a * (np.sqrt(b2) + Z_V[mask_exp]) ** 2
+
+    # Chi-squared branch — uses the caller's uniforms, already reflected
+    # to 1-U on the antithetic half.
+    if mask_chi.any():
+        p_prob = (psi[mask_chi] - 1) / (psi[mask_chi] + 1)
+        beta = (1 - p_prob) / m[mask_chi]
+        U_chi = U[mask_chi]
+        V_new[mask_chi] = np.where(U_chi <= p_prob, 0.0,
+                                   np.log((1 - p_prob) / (1 - U_chi)) / beta)
+
+    return np.maximum(V_new, 0.0)

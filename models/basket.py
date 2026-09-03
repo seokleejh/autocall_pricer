@@ -16,14 +16,20 @@ correlation matrix, applied to independently-drawn standard normals at
 every time step. All assets share one time grid (one scalar steps_per_year
 for the whole basket), so a single Cholesky application per step suffices.
 
-Antithetic variates use the same-stream, negate-at-draw-time pattern from
-heston.py (Z = anti_sign * rng.standard_normal(...), drawn sequentially from
-one ongoing rng across both halves) rather than local_vol.py's
-re-simulate-with-a-second-seeded-rng pattern. This matters more here than in
-the single-asset case: correlating draws via Cholesky requires the
-antithetic half to be the literal negation of the original half's draws, or
-the realized cross-asset correlation of the two halves would not mirror
-correctly.
+Antithetic variates simulate both halves of the ensemble in a single pass,
+so paths [half:] are the literal negation of paths [:half] -- the same
+normal draws with the sign flipped, and the same uniforms reflected to 1-U
+for the QE chi-squared branch. This matters more here than in the
+single-asset case: correlating draws via Cholesky requires the antithetic
+half to be the literal negation of the original half's draws, or the
+realized cross-asset correlation of the two halves would not mirror
+correctly. Negation commutes with the Cholesky map, so mirroring the
+independent drivers mirrors the correlated ones exactly.
+
+Drawing fresh normals for the mirror half and negating those would NOT
+achieve this: the normal law is symmetric, so a negated fresh draw is just
+another independent draw, and the pairing -- along with all of its variance
+reduction -- is lost.
 """
 
 from __future__ import annotations
@@ -167,16 +173,30 @@ class BasketLocalVolModel:
         obs = np.asarray(observation_times, dtype=float)
         t_grid = _build_time_grid(obs, self.steps_per_year)
 
-        half = n_paths // 2 if antithetic else n_paths
-        perf1 = self._simulate_batch(half, obs, t_grid, anti_sign=1)
         if antithetic:
-            perf2 = self._simulate_batch(half, obs, t_grid, anti_sign=-1)
-            return np.vstack([perf1, perf2])[:n_paths]
-        return perf1
+            half = n_paths // 2
+            n_sim = 2 * half
+        else:
+            half = 0
+            n_sim = n_paths
 
-    def _simulate_batch(
-        self, n: int, obs: np.ndarray, t_grid: np.ndarray, anti_sign: int
+        perf = self._simulate_ensemble(n_sim, half, obs, t_grid, antithetic)
+        return perf[:n_paths]
+
+    def _simulate_ensemble(
+        self, n: int, half: int, obs: np.ndarray, t_grid: np.ndarray,
+        antithetic: bool,
     ) -> np.ndarray:
+        """
+        Single-pass ensemble simulation.
+
+        Antithetic paths [half:] mirror paths [:half] using the SAME normal
+        draws with the sign flipped. Negation commutes with the Cholesky
+        map, so mirroring the independent drivers mirrors the correlated
+        ones and preserves the correlation structure exactly. Drawing fresh
+        normals for the mirror half instead would give independent paths and
+        no variance reduction.
+        """
         n_assets = self.n_assets
         S0 = np.array([s.spot for s in self.surfaces])
         r = np.array([s.rate for s in self.surfaces])
@@ -192,7 +212,11 @@ class BasketLocalVolModel:
             sqrt_dt = np.sqrt(dt)
             t_mid = 0.5 * (t_prev + t_next)
 
-            Z_indep = anti_sign * self.rng.standard_normal((n, n_assets))
+            if antithetic:
+                z = self.rng.standard_normal((half, n_assets))
+                Z_indep = np.vstack([z, -z])
+            else:
+                Z_indep = self.rng.standard_normal((n, n_assets))
             Z_corr = Z_indep @ self.L.T                 # (n, n_assets)
 
             sig = np.empty((n, n_assets))
@@ -297,16 +321,28 @@ class BasketHestonModel:
         obs = np.asarray(observation_times, dtype=float)
         t_grid = _build_time_grid(obs, self.steps_per_year)
 
-        half = n_paths // 2 if antithetic else n_paths
-        perf1 = self._simulate_batch(half, obs, t_grid, anti_sign=1)
         if antithetic:
-            perf2 = self._simulate_batch(half, obs, t_grid, anti_sign=-1)
-            return np.vstack([perf1, perf2])[:n_paths]
-        return perf1
+            half = n_paths // 2
+            n_sim = 2 * half
+        else:
+            half = 0
+            n_sim = n_paths
 
-    def _simulate_batch(
-        self, n: int, obs: np.ndarray, t_grid: np.ndarray, anti_sign: int
+        perf = self._simulate_ensemble(n_sim, half, obs, t_grid, antithetic)
+        return perf[:n_paths]
+
+    def _simulate_ensemble(
+        self, n: int, half: int, obs: np.ndarray, t_grid: np.ndarray,
+        antithetic: bool,
     ) -> np.ndarray:
+        """
+        Single-pass ensemble simulation.
+
+        Antithetic paths [half:] mirror paths [:half]: the SAME normals with
+        the sign flipped, and the SAME uniforms reflected as U -> 1-U for the
+        QE chi-squared branch. Negation commutes with the Cholesky map, so
+        the cross-asset correlation survives the reflection intact.
+        """
         n_assets = self.n_assets
         log_S = np.zeros((n, n_assets))
         V = np.tile(np.array([a.params.v0 for a in self.assets]), (n, 1))
@@ -320,15 +356,24 @@ class BasketHestonModel:
             # Each asset draws its own variance driver Z_V; the "market
             # factor" Z_market is correlated across assets via Cholesky and
             # plays the role Z_perp plays in the single-asset HestonModel.
-            Z_V = anti_sign * self.rng.standard_normal((n, n_assets))
-            Z_indep_perp = anti_sign * self.rng.standard_normal((n, n_assets))
+            if antithetic:
+                zv = self.rng.standard_normal((half, n_assets))
+                zp = self.rng.standard_normal((half, n_assets))
+                u = self.rng.uniform(size=(half, n_assets))
+                Z_V = np.vstack([zv, -zv])
+                Z_indep_perp = np.vstack([zp, -zp])
+                U = np.vstack([u, 1.0 - u])
+            else:
+                Z_V = self.rng.standard_normal((n, n_assets))
+                Z_indep_perp = self.rng.standard_normal((n, n_assets))
+                U = self.rng.uniform(size=(n, n_assets))
             Z_market = Z_indep_perp @ self.L.T
 
             V_new = np.empty_like(V)
             for a, asset in enumerate(self.assets):
                 p = asset.params
                 Z_S_a = p.rho * Z_V[:, a] + np.sqrt(1.0 - p.rho**2) * Z_market[:, a]
-                V_new[:, a] = self._qe_step(V[:, a], dt, Z_V[:, a], anti_sign, p)
+                V_new[:, a] = self._qe_step(V[:, a], dt, Z_V[:, a], U[:, a], p)
                 log_S[:, a] += (
                     (asset.rate - asset.div_yield - 0.5 * V[:, a]) * dt
                     + np.sqrt(np.maximum(V[:, a], 0.0) * dt) * Z_S_a
@@ -343,9 +388,14 @@ class BasketHestonModel:
         return performances
 
     def _qe_step(
-        self, V: np.ndarray, dt: float, Z_V: np.ndarray, anti_sign: int, params: HestonParams
+        self, V: np.ndarray, dt: float, Z_V: np.ndarray, U: np.ndarray, params: HestonParams
     ) -> np.ndarray:
-        """Andersen (2007) QE discretisation of CIR variance, per-asset params."""
+        """
+        Andersen (2007) QE discretisation of CIR variance, per-asset params.
+
+        `U` is a caller-supplied U(0,1) array, one per path, already
+        reflected to 1-U on the antithetic half.
+        """
         kappa, theta, xi = params.kappa, params.theta, params.xi
 
         e_kdt = np.exp(-kappa * dt)
@@ -370,8 +420,7 @@ class BasketHestonModel:
         if mask_chi.any():
             p_prob = (psi[mask_chi] - 1) / (psi[mask_chi] + 1)
             beta = (1 - p_prob) / m[mask_chi]
-            U_raw = self.rng.uniform(size=mask_chi.sum())
-            U = U_raw if anti_sign == 1 else 1.0 - U_raw
+            U = U[mask_chi]
             V_new[mask_chi] = np.where(U <= p_prob, 0.0, np.log((1 - p_prob) / (1 - U)) / beta)
 
         return np.maximum(V_new, 0.0)

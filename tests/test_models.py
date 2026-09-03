@@ -80,6 +80,84 @@ def test_antithetic_returns_correct_shape(flat_surf):
     assert perfs.shape == (200, 2)
 
 
+# ── antithetic variates are genuinely antithetic ──────────────────────────────
+# A true antithetic pair reuses the SAME random draws with the sign flipped, so
+# paths i and i + n/2 are strongly negatively correlated. Drawing fresh normals
+# for the second half and negating them yields independent paths -- the normal
+# law is symmetric -- which leaves prices unbiased but silently discards all of
+# the variance reduction. These tests pin the pairing down.
+
+ANTITHETIC_MODELS = [
+    ("LocalVol", lambda surf, seed: LocalVolModel(surface=surf, seed=seed)),
+    ("Heston",   lambda surf, seed: HestonModel(params=HestonParams(), spot=100.0,
+                                                rate=RATE, div_yield=DIV_YIELD, seed=seed)),
+    ("SABR",     lambda surf, seed: SABRModel(params=SABRParams(), spot=100.0,
+                                              rate=RATE, div_yield=DIV_YIELD, seed=seed)),
+]
+
+
+@pytest.mark.parametrize("name,build", ANTITHETIC_MODELS, ids=[m[0] for m in ANTITHETIC_MODELS])
+def test_antithetic_halves_are_negatively_correlated(flat_surf, name, build):
+    """Paths i and i + n/2 must be mirror images, not independent draws."""
+    perfs = build(flat_surf, SEED).simulate(20_000, [1.0], antithetic=True)[:, 0]
+    half = len(perfs) // 2
+    corr = float(np.corrcoef(perfs[:half], perfs[half:])[0, 1])
+    assert corr < -0.5, (
+        f"{name}: antithetic halves correlate {corr:+.3f}; a genuine pairing is "
+        f"strongly negative, ~0 means fresh draws were negated instead"
+    )
+
+
+@pytest.mark.parametrize("name,build", ANTITHETIC_MODELS, ids=[m[0] for m in ANTITHETIC_MODELS])
+def test_antithetic_reduces_variance(flat_surf, name, build):
+    """
+    The pairing must actually pay off: the standard error of an ATM call
+    estimated from n antithetic paths, computed the correct way (average each
+    pair into one observation), should beat n independent paths.
+    """
+    n = 40_000
+    plain = build(flat_surf, 11).simulate(n, [1.0], antithetic=False)[:, 0]
+    anti = build(flat_surf, 11).simulate(n, [1.0], antithetic=True)[:, 0]
+
+    pay_plain = np.maximum(plain - 1.0, 0.0)
+    pay_anti = np.maximum(anti - 1.0, 0.0)
+
+    se_plain = pay_plain.std(ddof=1) / np.sqrt(len(pay_plain))
+    half = len(pay_anti) // 2
+    pair_means = 0.5 * (pay_anti[:half] + pay_anti[half:])
+    se_anti = pair_means.std(ddof=1) / np.sqrt(half)
+
+    assert se_anti < se_plain, (
+        f"{name}: antithetic SE {se_anti:.6f} should beat plain SE {se_plain:.6f}"
+    )
+
+
+def test_mc_pricer_standard_error_accounts_for_pairing(flat_surf):
+    """
+    MCPricer must use the pair-aware estimator when antithetic is on.
+    Treating the paths as independent ignores the negative covariance and
+    overstates the error, throwing away the variance reduction on paper.
+    """
+    from engine.mc_pricer import MCPricer
+    from products.autocallable import AutocallableNote
+
+    note = AutocallableNote(
+        spot=100.0, maturity=2.0, observation_dates=[1.0, 2.0],
+        autocall_barriers=1.0, coupon_rate=0.06,
+        capital_barrier=0.6, discount_rate=RATE,
+    )
+    model = LocalVolModel(surface=flat_surf, seed=SEED)
+    pricer = MCPricer(model, "LV", antithetic=True)
+    result = pricer.price(note, 20_000)
+
+    payoffs = note.evaluate_payoff(
+        LocalVolModel(surface=flat_surf, seed=SEED).simulate(
+            20_000, note.observation_dates, antithetic=True)
+    )
+    naive_se = float(np.std(payoffs, ddof=1) / np.sqrt(len(payoffs)))
+    assert result.std_error < naive_se
+
+
 def test_performances_are_positive(flat_surf):
     """All simulated performance values should be positive."""
     for ModelCls, kwargs in [

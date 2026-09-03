@@ -66,17 +66,24 @@ class LocalVolModel:
         r = self.surface.rate
         q = self.surface.div_yield
 
+        # Antithetic paths are the exact mirror of their partner: the second
+        # half of the ensemble reuses the SAME normal draws with the sign
+        # flipped, so each pair is perfectly negatively correlated. Drawing
+        # fresh normals for the mirror half and negating them would produce
+        # statistically independent paths -- the normal law is symmetric --
+        # and would buy no variance reduction at all.
         if antithetic:
             half = n_paths // 2
-            draw_paths = half
+            n_sim = 2 * half
         else:
-            draw_paths = n_paths
+            half = 0
+            n_sim = n_paths
 
-        # Build full time grid
         t_grid = self._build_time_grid(obs)
+        K_lo, K_hi = self.surface.strike_range
 
-        S = np.full(draw_paths, S0, dtype=float)
-        performances = np.zeros((draw_paths, len(obs)))
+        S = np.full(n_sim, S0, dtype=float)
+        performances = np.zeros((n_sim, len(obs)))
 
         obs_idx = 0
         t_prev = 0.0
@@ -86,50 +93,22 @@ class LocalVolModel:
             sqrt_dt = np.sqrt(dt)
 
             t_mid = 0.5 * (t_prev + t_next)
-            K_lo, K_hi = self.surface.strike_range
-            S_clamped = np.clip(S, K_lo, K_hi)
-            sig = self.surface.local_vol_batch(t_mid, S_clamped)
+            sig = self.surface.local_vol_batch(t_mid, np.clip(S, K_lo, K_hi))
 
-            Z = self.rng.standard_normal(draw_paths)
+            if antithetic:
+                Z_half = self.rng.standard_normal(half)
+                Z = np.concatenate([Z_half, -Z_half])
+            else:
+                Z = self.rng.standard_normal(n_sim)
+
             S = S * np.exp((r - q - 0.5 * sig**2) * dt + sig * sqrt_dt * Z)
             S = np.maximum(S, 1e-6)  # absorbing floor
 
-            # Record at observation dates
             if obs_idx < len(obs) and np.isclose(t_next, obs[obs_idx]):
                 performances[:, obs_idx] = S / S0
                 obs_idx += 1
 
             t_prev = t_next
-
-        if antithetic:
-            # Mirror paths: repeat simulation with negated normals implicitly by
-            # noting S_anti = S0 * exp((r-q-0.5sig^2)*dt - sig*sqrt_dt*Z)
-            # We re-simulate to keep code simple and memory-efficient.
-            S_anti = np.full(draw_paths, S0, dtype=float)
-            perf_anti = np.zeros((draw_paths, len(obs)))
-            obs_idx = 0
-            t_prev = 0.0
-            self.rng  # reuse same rng but we need the same Z — regenerate deterministically
-            # Regenerate by seeding a local rng with a fixed offset (simpler: just run again)
-            rng2 = np.random.default_rng(self.rng.integers(1 << 31))
-
-            t_grid2 = self._build_time_grid(obs)
-            for t_next in t_grid2:
-                dt = t_next - t_prev
-                sqrt_dt = np.sqrt(dt)
-                t_mid = 0.5 * (t_prev + t_next)
-                K_lo, K_hi = self.surface.strike_range
-                S_anti_clamped = np.clip(S_anti, K_lo, K_hi)
-                sig = self.surface.local_vol_batch(t_mid, S_anti_clamped)
-                Z = rng2.standard_normal(draw_paths)
-                S_anti = S_anti * np.exp((r - q - 0.5 * sig**2) * dt + sig * sqrt_dt * (-Z))
-                S_anti = np.maximum(S_anti, 1e-6)
-                if obs_idx < len(obs) and np.isclose(t_next, obs[obs_idx]):
-                    perf_anti[:, obs_idx] = S_anti / S0
-                    obs_idx += 1
-                t_prev = t_next
-
-            performances = np.vstack([performances, perf_anti])
 
         return performances[:n_paths]
 

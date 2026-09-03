@@ -71,7 +71,7 @@ class MCPricer:
         )
         payoffs = product.evaluate_payoff(performances)
         price = float(np.mean(payoffs))
-        se = float(np.std(payoffs, ddof=1) / np.sqrt(len(payoffs)))
+        se = self._standard_error(payoffs)
         ci = (price - 1.96 * se, price + 1.96 * se)
         duration = product.evaluate_duration(performances)
         return PricingResult(
@@ -82,6 +82,28 @@ class MCPricer:
             model_name=self.model_name,
             expected_duration=duration,
         )
+
+    def _standard_error(self, payoffs: np.ndarray) -> float:
+        """
+        Standard error of the MC mean.
+
+        With antithetic variates the paths are NOT independent: by the
+        convention every model in this repo follows, path i and path
+        i + n/2 are an antithetic pair driven by mirrored random numbers,
+        and their payoffs are negatively correlated. Treating all n paths
+        as independent -- std(payoffs) / sqrt(n) -- ignores that covariance
+        and systematically OVERSTATES the error, which would throw away on
+        paper exactly the variance reduction the pairing bought.
+
+        The correct estimator averages each pair into a single independent
+        observation and takes the standard error over those n/2 draws.
+        """
+        n = len(payoffs)
+        if self.antithetic and n >= 4 and n % 2 == 0:
+            half = n // 2
+            pair_means = 0.5 * (payoffs[:half] + payoffs[half:])
+            return float(np.std(pair_means, ddof=1) / np.sqrt(half))
+        return float(np.std(payoffs, ddof=1) / np.sqrt(n))
 
     def price_batch(
         self,
