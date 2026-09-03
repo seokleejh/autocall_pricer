@@ -115,8 +115,18 @@ class ImpliedVolSurface:
         y = np.log(K / F)
 
         w = self.total_variance(T, K)
-        w_T_up = self.total_variance(T + dT, K)
-        w_T_dn = self.total_variance(T - dT, K)
+
+        # dw/dT must be taken at FIXED LOG-MONEYNESS y = ln(K/F(T)), which is
+        # the variable this formula is written in -- NOT at fixed strike. The
+        # two differ because the forward drifts with T:
+        #     dw/dT|_K = dw/dT|_y - (r-q) * dw/dy
+        # Holding K fixed instead biases sigma_LV by roughly (r-q)*dw/dy,
+        # which is zero for a flat surface but not for any skewed one.
+        # Shifting the strike with the forward holds y constant.
+        K_T_up = K * self.forward(T + dT) / F
+        K_T_dn = K * self.forward(T - dT) / F
+        w_T_up = self.total_variance(T + dT, K_T_up)
+        w_T_dn = self.total_variance(T - dT, K_T_dn)
         dw_dT = (w_T_up - w_T_dn) / (2 * dT)
 
         w_K_up = self.total_variance(T, K + dK)
@@ -158,9 +168,14 @@ class ImpliedVolSurface:
             iv = np.maximum(self._spline(t_arr, lm, grid=False), 1e-6)
             return iv ** 2 * t_arr
 
+        # dw/dT at FIXED LOG-MONEYNESS -- see the comment in local_variance().
+        # In spline coordinates, holding y = ln(K/F(T)) fixed while T moves by
+        # dT means shifting ln(K/spot) by exactly (r - q) * dT.
+        drift = self.rate - self.div_yield
+
         w       = _w(T_arr, log_m)
-        w_T_up  = _w(T_up,  log_m)
-        w_T_dn  = _w(T_dn,  log_m)
+        w_T_up  = _w(T_up,  log_m + drift * dT)
+        w_T_dn  = _w(T_dn,  log_m - drift * dT)
         w_K_up  = _w(T_arr, log_m_up)
         w_K_dn  = _w(T_arr, log_m_dn)
 
