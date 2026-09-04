@@ -7,3 +7,8 @@ __pycache__/
 data/*.csv
 results/
 *.png
+
+# Generated output — regenerate rather than version.
+# run_scenarios.py writes scenarios/results.csv by default;
+# model_quality.py writes the diagnostic plots.
+scenarios/*.csv
