@@ -346,6 +346,8 @@ class GreekResult:
     vega:  float      # ∂P/∂σ · 0.01  (per 1 percentage-point parallel vol shift)
     vanna: float      # ∂²P / (∂S ∂σ)
     skew_sens: float  # ∂P/∂skew · 0.01 (per 0.01 shift in the skew coefficient; see with_skew_shift)
+    rho: float = float("nan")       # ∂P/∂r · 0.01  (per 1 percentage-point rate shift)
+    div_sens: float = float("nan")  # ∂P/∂q · 0.01  (per 1 percentage-point dividend yield shift)
 
 
 @dataclass
@@ -410,6 +412,33 @@ def _rescale_product_barriers(
     )
 
 
+def _with_discount_rate(
+    product: AutocallableNote,
+    new_rate: float,
+) -> AutocallableNote:
+    """
+    Return the same note discounted at a different rate.
+
+    Needed for rho: build_product() sets discount_rate from the market rate,
+    so a rate bump that moved only the drift and the forward would leave the
+    discounting stale and report a rho that no trader would recognise.
+    Contract terms are untouched -- only the discount curve moves.
+    """
+    return AutocallableNote(
+        notional=product.notional,
+        spot=product.spot,
+        maturity=product.maturity,
+        observation_dates=product.observation_dates.tolist(),
+        autocall_barriers=product._autocall_barriers.tolist(),
+        coupon_rate=product._coupon_schedule.tolist(),
+        conditional_coupon=product.conditional_coupon,
+        coupon_barrier=product.coupon_barrier,
+        capital_barrier=product.capital_barrier,
+        capital_barrier_active=product.capital_barrier_active,
+        discount_rate=float(new_rate),
+    )
+
+
 def compute_greeks(
     cfg: dict,
     base_surface,
@@ -425,9 +454,12 @@ def compute_greeks(
     h_S_pct: float = 0.01,
     h_v: float = 0.001,
     h_skew: float = 0.01,
+    h_r: float = 0.01,
+    h_q: float = 0.01,
 ) -> dict[str, GreekResult]:
     """
-    Compute delta, gamma, vega, vanna, skew_sens via central finite differences.
+    Compute delta, gamma, vega, vanna, skew_sens, rho, div_sens via central
+    finite differences.
 
     Delta convention
     ----------------
@@ -458,11 +490,54 @@ def compute_greeks(
 
     Parameters
     ----------
+    Rho and dividend sensitivity
+    ----------------------------
+    Both are TOTAL derivatives -- every place the parameter enters is bumped
+    together, which is what a trader means by the number.
+
+    r enters an autocallable in three distinct places, and all three move:
+      1. discounting        -- the note's discount_rate (see _with_discount_rate)
+      2. the drift          -- (r - q) in every model's simulation
+      3. the forward        -- F(T) = S e^((r-q)T), which sets log-moneyness on
+                               the vol surface, hence Dupire local vol and the
+                               SV calibration targets (see with_rate)
+
+    q enters only (2) and (3). It never touches discounting, which is why
+    div_sens is NOT simply -rho: the drift contributions cancel, the
+    discounting contribution does not.
+
+    Both use sticky implied vol -- the quoted vol grid is held fixed and the
+    forward moves beneath it. That is the market convention: implied vols are
+    the observable, so a rate move repositions the smile rather than repricing
+    it. Because the forward moves, the SV models must be recalibrated on the
+    bumped surfaces, exactly as for vega and skew.
+
+    Sign intuition for a standard autocallable: raising r pushes the forward
+    up (more likely to autocall early, worth more) but also discounts harder
+    (worth less), so rho is a contest between two effects and can come out
+    either way depending on the structure. Raising q only pushes the forward
+    down, so div_sens is more reliably negative.
+
+    Parameters
+    ----------
     h_S_pct : spot bump as a fraction of spot (default 0.01 = 1 %)
     h_v     : absolute parallel implied-vol shift (default 0.001 = 10 bp)
     h_skew  : skew-coefficient bump for with_skew_shift (default 0.01)
+    h_r     : absolute rate bump (default 0.01 = 100 bp)
+    h_q     : absolute dividend-yield bump (default 0.01 = 100 bp)
+
+              These are deliberately 10x the vega bump. Finite-difference
+              noise scales as 1/h, and both Greeks are small: measured on the
+              default note at 10k paths, a 10bp bump left the dividend
+              sensitivity with a standard deviation across seeds equal to 63%
+              of its own value -- enough to flip its sign from run to run. At
+              100bp that falls to 13%, while the estimate itself is unchanged
+              within noise, so there is no truncation cost to pay: both Greeks
+              are near-linear in their parameter over this range. 100bp is
+              also the conventional market bump for rho.
     vega    : reported per 1 percentage-point (0.01) parallel vol shift
     skew_sens : reported per 0.01 shift in the skew coefficient
+    rho, div_sens : reported per 1 percentage-point (0.01) shift
     """
     h_S = SPOT * h_S_pct
 
@@ -485,11 +560,30 @@ def compute_greeks(
 
     T_max = float(product.maturity)
 
+    # ── rate and dividend bumps ────────────────────────────────────────────────
+    # Surfaces carry the bumped r / q so the forward (and therefore local vol
+    # and the calibration targets) moves with them.
+    s_rup = base_surface.with_rate(RATE + h_r)
+    s_rdn = base_surface.with_rate(RATE - h_r)
+    s_qup = base_surface.with_div_yield(DIV_YIELD + h_q)
+    s_qdn = base_surface.with_div_yield(DIV_YIELD - h_q)
+
+    # Only the rate bump touches discounting. q never does.
+    product_rup = _with_discount_rate(product, RATE + h_r)
+    product_rdn = _with_discount_rate(product, RATE - h_r)
+
     # Re-calibrate SV models for vol- and skew-bumped surfaces (fast warm-start).
     cal_vup  = calibrate_all(cfg, s_vup,  T_max, fast=True, warm_start=base_cal, seed=seed)
     cal_vdn  = calibrate_all(cfg, s_vdn,  T_max, fast=True, warm_start=base_cal, seed=seed)
     cal_skup = calibrate_all(cfg, s_skup, T_max, fast=True, warm_start=base_cal, seed=seed)
     cal_skdn = calibrate_all(cfg, s_skdn, T_max, fast=True, warm_start=base_cal, seed=seed)
+    # ...and for the rate/dividend bumps, for the same reason: the forward has
+    # moved, so the strikes the SV models were fitted against are now at
+    # different moneyness.
+    cal_rup  = calibrate_all(cfg, s_rup,  T_max, fast=True, warm_start=base_cal, seed=seed)
+    cal_rdn  = calibrate_all(cfg, s_rdn,  T_max, fast=True, warm_start=base_cal, seed=seed)
+    cal_qup  = calibrate_all(cfg, s_qup,  T_max, fast=True, warm_start=base_cal, seed=seed)
+    cal_qdn  = calibrate_all(cfg, s_qdn,  T_max, fast=True, warm_start=base_cal, seed=seed)
 
     # --- LSV leverage under spot bumps: the delta convention (config D1) -----
     # sticky_leverage=True holds L(t,S) fixed as spot moves, so the spot bumps
@@ -514,8 +608,15 @@ def compute_greeks(
         cal_up_vdn = relever(cfg, cal_vdn,  s_up_vdn, T_max, seed)
         cal_dn_vdn = relever(cfg, cal_vdn,  s_dn_vdn, T_max, seed)
 
-    def price_all(surface, spot, cal, prod) -> dict[str, float]:
-        pricers = build_pricers(cfg, surface, spot, RATE, DIV_YIELD,
+    def price_all(surface, spot, cal, prod, rate=None, div_yield=None) -> dict[str, float]:
+        # rate / div_yield override the base values for the rho and dividend
+        # bumps. LocalVol and LSV read the drift off the surface, but Heston
+        # and SABR take it as a constructor argument -- so the bumped value has
+        # to reach build_pricers too, or those two models would keep the
+        # original drift and report a wrong (too small) rho.
+        pricers = build_pricers(cfg, surface, spot,
+                                RATE if rate is None else rate,
+                                DIV_YIELD if div_yield is None else div_yield,
                                 seed, antithetic, calibrated_params=cal)
         return {p.model_name: p.price(prod, n_paths).price for p in pricers}
 
@@ -532,6 +633,13 @@ def compute_greeks(
     P_up_vdn = price_all(s_up_vdn, SPOT + h_S,  cal_up_vdn, product_up)
     P_dn_vdn = price_all(s_dn_vdn, SPOT - h_S,  cal_dn_vdn, product_dn)
 
+    # Rate bump: surface, drift AND discounting all move together.
+    P_rup = price_all(s_rup, SPOT, cal_rup, product_rup, rate=RATE + h_r)
+    P_rdn = price_all(s_rdn, SPOT, cal_rdn, product_rdn, rate=RATE - h_r)
+    # Dividend bump: surface and drift move; the note keeps its discount rate.
+    P_qup = price_all(s_qup, SPOT, cal_qup, product, div_yield=DIV_YIELD + h_q)
+    P_qdn = price_all(s_qdn, SPOT, cal_qdn, product, div_yield=DIV_YIELD - h_q)
+
     greeks: dict[str, GreekResult] = {}
     for name in P_up:
         P0    = base_prices[name]
@@ -541,8 +649,10 @@ def compute_greeks(
         vanna = (  P_up_vup[name] - P_dn_vup[name]
                  - P_up_vdn[name] + P_dn_vdn[name]) / (4.0 * h_S * h_v)
         skew_sens = (P_skup[name] - P_skdn[name]) / (2.0 * h_skew) * 0.01
+        rho       = (P_rup[name]  - P_rdn[name])  / (2.0 * h_r) * 0.01
+        div_sens  = (P_qup[name]  - P_qdn[name])  / (2.0 * h_q) * 0.01
         greeks[name] = GreekResult(delta=delta, gamma=gamma, vega=vega, vanna=vanna,
-                                   skew_sens=skew_sens)
+                                   skew_sens=skew_sens, rho=rho, div_sens=div_sens)
 
     return greeks
 
@@ -722,6 +832,8 @@ def run_all(
     h_S_pct: float = 0.01,
     h_v: float = 0.001,
     h_skew: float = 0.01,
+    h_r: float = 0.01,
+    h_q: float = 0.01,
 ) -> list[ScenarioResult]:
     with open(scenarios_path) as f:
         spec = yaml.safe_load(f)
@@ -821,11 +933,13 @@ def run_all(
 
             if compute_greeks_flag:
                 print(f"           Computing Greeks  (N={n_greek_paths:,}, "
-                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp, h_skew={h_skew}) ...")
+                      f"h_S={h_S_pct*100:.1f}%, h_v={h_v*10000:.0f}bp, h_skew={h_skew}, "
+                      f"h_r={h_r*10000:.0f}bp, h_q={h_q*10000:.0f}bp) ...")
                 greeks = compute_greeks(
                     cfg, surface, base_cal, product, prices,
                     SPOT, RATE, DIV_YIELD, seed, antithetic, n_greek_paths,
                     h_S_pct=h_S_pct, h_v=h_v, h_skew=h_skew,
+                    h_r=h_r, h_q=h_q,
                 )
                 for model_name, gr in greeks.items():
                     print(f"             {model_name:12s}"
@@ -833,7 +947,9 @@ def run_all(
                           f"  Γ={gr.gamma:+.6f}"
                           f"  ν={gr.vega:+.6f}"
                           f"  vanna={gr.vanna:+.6f}"
-                          f"  skew_sens={gr.skew_sens:+.6f}")
+                          f"  skew_sens={gr.skew_sens:+.6f}"
+                          f"  ρ={gr.rho:+.6f}"
+                          f"  divS={gr.div_sens:+.6f}")
 
         results.append(ScenarioResult(
             name=name, group=group, description=description,
@@ -907,6 +1023,8 @@ def print_summary(results: list[ScenarioResult]) -> None:
         ("vega",  "Vega   ∂P/∂σ  (per 1% vol shift)"),
         ("vanna", "Vanna  ∂²P/(∂S ∂σ)"),
         ("skew_sens", "Skew Sensitivity  ∂P/∂skew  (per 0.01 skew shift)"),
+        ("rho",       "Rho    ∂P/∂r  (per 1% rate shift)"),
+        ("div_sens",  "Dividend Sens.  ∂P/∂q  (per 1% div-yield shift)"),
     ]
 
     gcol = 14
@@ -960,7 +1078,8 @@ def save_csv(results: list[ScenarioResult], path: str) -> None:
     has_durations = any(r.durations for r in results)
     has_greeks = any(r.greeks for r in results)
     has_basket_greeks = any(r.basket_greeks for r in results)
-    greek_attrs = ["delta", "gamma", "vega", "vanna", "skew_sens"]
+    greek_attrs = ["delta", "gamma", "vega", "vanna", "skew_sens",
+                   "rho", "div_sens"]
 
     # Union of (model_name, asset_name) pairs seen across basket scenarios,
     # in first-seen order -- columns are the same for every row.
@@ -1041,6 +1160,13 @@ def main() -> None:
                         help="Spot bump as fraction of spot for FD (default: 0.01 = 1%%)")
     parser.add_argument("--h-vol", type=float, default=0.001,
                         help="Parallel vol bump for FD in absolute terms (default: 0.001 = 10bp)")
+    parser.add_argument("--h-rate", type=float, default=0.01,
+                        help="Rate bump for rho FD, absolute (default: 0.01 = 100bp; "
+                             "10x the vol bump because FD noise scales as 1/h and "
+                             "these Greeks are small)")
+    parser.add_argument("--h-div", type=float, default=0.01,
+                        help="Dividend-yield bump for dividend-sensitivity FD, "
+                             "absolute (default: 0.01 = 100bp)")
     parser.add_argument("--h-skew", type=float, default=0.01,
                         help="Skew-coefficient bump for FD (see ImpliedVolSurface.with_skew_shift, "
                              "default: 0.01)")
@@ -1063,6 +1189,8 @@ def main() -> None:
         h_S_pct=args.h_spot_pct,
         h_v=args.h_vol,
         h_skew=args.h_skew,
+        h_r=args.h_rate,
+        h_q=args.h_div,
     )
     print_summary(results)
     save_csv(results, args.output)

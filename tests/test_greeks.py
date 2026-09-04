@@ -285,3 +285,172 @@ def test_vega_positive_capital_protected_no_ki():
     # Capital-protected note should have less negative (or more positive) vega
     assert vega_prot > vega_std, \
         f"Protected vega {vega_prot:.4f} should exceed standard {vega_std:.4f}"
+
+
+# ── rho and dividend sensitivity ──────────────────────────────────────────────
+# These two are validated against exact references rather than by sign alone,
+# because they have them:
+#
+#   * A note that can never autocall and is capital protected IS a pure
+#     discount bond. Its price is exp(-rT) with no MC error at all (every path
+#     redeems the same amount), so rho has a closed form and dividend
+#     sensitivity must be identically zero.
+#
+#   * r and q enter the drift and the forward ONLY through (r - q). Those
+#     contributions therefore cancel in (rho + div_sens), leaving nothing but
+#     the discounting term. That identity is model-independent and holds for
+#     any structure, so it catches the realistic failure mode: bumping r in
+#     some places but not others.
+
+import yaml  # noqa: E402
+from scenarios.run_scenarios import (  # noqa: E402
+    build_surface, build_product, calibrate_all, build_pricers,
+    compute_greeks, _with_discount_rate,
+)
+
+GREEK_RATE = 0.03
+GREEK_DIV = 0.01
+GREEK_SPOT = 100.0
+GREEK_BUMP = 0.01
+
+
+def _greek_cfg():
+    """Two models is enough to prove the machinery; LSV/SABR add only runtime."""
+    return {
+        "vol_surface": {"type": "term_structure", "vol_short": 0.25,
+                        "vol_long": 0.18, "kappa": 1.5, "skew": -0.10,
+                        "convexity": 0.02, "T_max": 5.0},
+        "models": {"local_vol": True, "heston": True, "lsv": False, "sabr": False},
+    }
+
+
+@pytest.fixture(scope="module")
+def greek_env():
+    cfg = _greek_cfg()
+    surface = build_surface(cfg, GREEK_SPOT, GREEK_RATE, GREEK_DIV)
+    cal = calibrate_all(cfg, surface, 3.0)
+    return cfg, surface, cal
+
+
+def _price_all(cfg, surface, cal, product, n_paths, rate=GREEK_RATE, div=GREEK_DIV):
+    return {p.model_name: p.price(product, n_paths).price
+            for p in build_pricers(cfg, surface, GREEK_SPOT, rate, div,
+                                   SEED, True, cal)}
+
+
+def _discount_bond_note(maturity=3.0):
+    """
+    Never autocalls (barrier at 99x spot) and returns notional regardless of
+    final performance, so its value is exp(-r*T) on every single path.
+    """
+    return AutocallableNote(
+        notional=1.0, spot=GREEK_SPOT, maturity=maturity,
+        observation_dates=[1.0, 2.0, maturity],
+        autocall_barriers=99.0, coupon_rate=0.0,
+        capital_barrier=0.0, capital_barrier_active=False,
+        discount_rate=GREEK_RATE,
+    )
+
+
+def test_rho_matches_discount_bond_closed_form(greek_env):
+    """
+    For a pure discount bond P(r) = exp(-rT), so rho has a closed form.
+
+    The assertion compares against the central DIFFERENCE of that closed form
+    at the same bump, not against the exact derivative -dP/dr. Those differ by
+    O(h^2 T^3 / 6) truncation -- about 5e-6 at the 100bp default -- which is a
+    property of central differencing, not of this code. Comparing like with
+    like isolates the machinery and lets the tolerance be tight enough to
+    catch a real error.
+
+    The exact derivative is then checked separately, loosely, to confirm the
+    bump is small enough that the FD estimate still means what it claims.
+    """
+    cfg, surface, cal = greek_env
+    T = 3.0
+    h = 0.01
+    note = _discount_bond_note(T)
+    base = _price_all(cfg, surface, cal, note, 4_000)
+    g = compute_greeks(cfg, surface, cal, note, base, GREEK_SPOT,
+                       GREEK_RATE, GREEK_DIV, SEED, True, 4_000,
+                       h_r=h, h_q=h)
+
+    fd_of_closed_form = (
+        (np.exp(-(GREEK_RATE + h) * T) - np.exp(-(GREEK_RATE - h) * T)) / (2 * h)
+    ) * 0.01
+    exact = -T * np.exp(-GREEK_RATE * T) * 0.01
+
+    for model, gr in g.items():
+        assert gr.rho == pytest.approx(fd_of_closed_form, abs=1e-9), (
+            f"{model}: rho {gr.rho:.10f} vs FD of closed form "
+            f"{fd_of_closed_form:.10f}"
+        )
+        assert gr.rho == pytest.approx(exact, rel=1e-3), (
+            f"{model}: rho {gr.rho:.8f} strays from the exact derivative "
+            f"{exact:.8f} -- bump may be too large"
+        )
+
+
+def test_div_sens_exactly_zero_for_discount_bond(greek_env):
+    """
+    A pure discount bond has no equity exposure, so the dividend yield cannot
+    reach its price through any route. Anything non-zero means q has leaked
+    somewhere it does not belong -- most likely into discounting.
+    """
+    cfg, surface, cal = greek_env
+    note = _discount_bond_note()
+    base = _price_all(cfg, surface, cal, note, 4_000)
+    g = compute_greeks(cfg, surface, cal, note, base, GREEK_SPOT,
+                       GREEK_RATE, GREEK_DIV, SEED, True, 4_000)
+    for model, gr in g.items():
+        assert gr.div_sens == pytest.approx(0.0, abs=1e-9), (
+            f"{model}: div_sens {gr.div_sens:.10f} should be identically zero"
+        )
+
+
+def test_rho_plus_div_sens_isolates_discounting(greek_env):
+    """
+    rho + div_sens must equal a rho computed by bumping ONLY the discount rate.
+
+    This is the structural test: r and q reach the price through the drift and
+    the forward only as (r - q), so those terms cancel in the sum. If either
+    Greek bumped its parameter in some places but not others -- say it moved
+    the drift but forgot the surface, or discounted at a stale rate -- the
+    cancellation breaks and this fails.
+    """
+    cfg, surface, cal = greek_env
+    note = make_standard_note(discount_rate=GREEK_RATE)
+    n = 20_000
+    base = _price_all(cfg, surface, cal, note, n)
+    g = compute_greeks(cfg, surface, cal, note, base, GREEK_SPOT,
+                       GREEK_RATE, GREEK_DIV, SEED, True, n,
+                       h_r=GREEK_BUMP, h_q=GREEK_BUMP)
+
+    up = _price_all(cfg, surface, cal,
+                    _with_discount_rate(note, GREEK_RATE + GREEK_BUMP), n)
+    dn = _price_all(cfg, surface, cal,
+                    _with_discount_rate(note, GREEK_RATE - GREEK_BUMP), n)
+
+    for model in base:
+        discount_only = (up[model] - dn[model]) / (2 * GREEK_BUMP) * 0.01
+        total = g[model].rho + g[model].div_sens
+        assert total == pytest.approx(discount_only, abs=5e-5), (
+            f"{model}: rho+div_sens {total:.6f} should isolate the discounting "
+            f"term {discount_only:.6f}"
+        )
+
+
+def test_div_sens_negative_for_standard_autocall(greek_env):
+    """
+    Raising the dividend yield lowers the forward, so the underlying drifts
+    lower: less likely to autocall, more likely to breach the knock-in. Both
+    hurt a standard autocallable, so dividend sensitivity is negative.
+    """
+    cfg, surface, cal = greek_env
+    note = make_standard_note(discount_rate=GREEK_RATE)
+    n = 20_000
+    base = _price_all(cfg, surface, cal, note, n)
+    g = compute_greeks(cfg, surface, cal, note, base, GREEK_SPOT,
+                       GREEK_RATE, GREEK_DIV, SEED, True, n)
+    for model, gr in g.items():
+        assert gr.div_sens < 0, f"{model}: div_sens {gr.div_sens:+.6f} should be negative"

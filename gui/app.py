@@ -423,7 +423,8 @@ with tab_results:
         st.bar_chart(spread, height=260)
 
     # -- greeks ---------------------------------------------------------------
-    greek_names = ["duration", "delta", "gamma", "vega", "vanna", "skew_sens"]
+    greek_names = ["duration", "delta", "gamma", "vega", "vanna", "skew_sens",
+                   "rho", "div_sens"]
     present = [g for g in greek_names
                if all(f"{m}_{g}" in df.columns for m in models)]
     if present:

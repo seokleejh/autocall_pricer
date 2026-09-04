@@ -206,6 +206,39 @@ class ImpliedVolSurface:
             self.spot, self.rate, self.div_yield,
         )
 
+    def with_rate(self, new_rate: float) -> "ImpliedVolSurface":
+        """
+        New surface at a different risk-free rate (for rho).
+
+        The implied vol GRID is carried over unchanged -- "sticky implied vol",
+        the standard market convention: quoted vols are the observable, and a
+        rate move repositions the forward beneath them rather than repricing
+        the smile. Everything downstream follows from the forward moving:
+        F(T) = S e^((r-q)T) shifts, so log-moneyness at a fixed strike shifts,
+        so Dupire local vol changes and the SV calibration targets move.
+
+        Note this is NOT the whole of rho for a discounted product -- the
+        discount factor and the simulation drift also depend on r, and both
+        must be bumped in step. See compute_greeks().
+        """
+        return ImpliedVolSurface(
+            self._T, self._K, self._vols.copy(),
+            self.spot, float(new_rate), self.div_yield,
+        )
+
+    def with_div_yield(self, new_div_yield: float) -> "ImpliedVolSurface":
+        """
+        New surface at a different dividend yield (for dividend sensitivity).
+
+        Same sticky-implied-vol convention as with_rate(). q enters only
+        through the forward and the drift -- never through discounting, which
+        is why dividend sensitivity is not simply the negative of rho.
+        """
+        return ImpliedVolSurface(
+            self._T, self._K, self._vols.copy(),
+            self.spot, self.rate, float(new_div_yield),
+        )
+
     def with_skew_shift(self, h: float, T_floor: float = 0.25) -> "ImpliedVolSurface":
         """
         New surface with a skew bump: tilts the smile around each maturity's own

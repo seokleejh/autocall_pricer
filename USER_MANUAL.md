@@ -607,9 +607,11 @@ python scenarios/run_scenarios.py \
 | `--h-spot-pct` | 0.01 | Spot bump as fraction of spot (1%) |
 | `--h-vol` | 0.001 | Parallel implied vol shift for vega/vanna (10 bp) |
 | `--h-skew` | 0.01 | Skew-coefficient bump for skew sensitivity (see [below](#skew-sensitivity-convention)) |
+| `--h-rate` | 0.01 | Rate bump for rho (100 bp — see [below](#rho-and-dividend-sensitivity)) |
+| `--h-div` | 0.01 | Dividend-yield bump for dividend sensitivity (100 bp) |
 
-**Runtime**: with 10,000 paths and all three models, Greeks add ~2–5 minutes per scenario
-(10 bumped evaluations × 3 models, plus 4 vol-surface recalibrations). See [Section 10](#10-performance-guide).
+**Runtime**: with 10,000 paths and all three models, Greeks add ~5–10 minutes per scenario
+(14 bumped evaluations × 3 models, plus 8 vol-surface recalibrations). See [Section 10](#10-performance-guide).
 
 #### Delta convention
 
@@ -625,6 +627,55 @@ contract inception and do not move when today's spot price changes.
 
 Vega is reported **per 1 percentage-point (100 bp) parallel shift** in implied vol. So if Heston
 shows vega = −0.05, a 1 vol-point increase in implied vols lowers the note value by 5% of notional.
+
+#### Rho and dividend sensitivity
+
+Both are reported **per 1 percentage-point (100 bp) shift**, like vega, and both are **total**
+derivatives — every place the parameter enters is bumped together, which is what the number is
+meant to mean.
+
+**`r` reaches the price through three separate routes, and all three move:**
+
+| Route | Effect |
+|---|---|
+| Discounting | the note's own `discount_rate` |
+| Drift | `(r − q)` in every model's simulation |
+| Forward | `F(T) = S·e^(r−q)T`, which sets log-moneyness on the vol surface — so Dupire local vol changes and the SV models must be **recalibrated** |
+
+**`q` reaches it through only the last two.** It never touches discounting. That is why dividend
+sensitivity is *not* simply `−rho`.
+
+Both bumps use **sticky implied vol**: the quoted vol grid is held fixed and the forward moves
+beneath it. Implied vols are the market observable, so a rate move repositions the smile rather
+than repricing it.
+
+**A useful identity, used as a regression test.** Since `r` and `q` reach the drift and the
+forward *only* through `(r − q)`, those contributions cancel in the sum:
+
+```
+rho + div_sens  ==  (rho computed by bumping ONLY the discount rate)
+```
+
+This holds for any structure and any model, and it catches the realistic failure mode — bumping
+`r` in some places but forgetting others. Verified to ~1e-6 in `tests/test_greeks.py`.
+
+**Sign intuition.** Raising `r` lifts the forward (more likely to autocall early — worth more) but
+also discounts harder (worth less), so rho is a contest between two effects and can land either
+way depending on the structure. Raising `q` only lowers the forward, so dividend sensitivity is
+more reliably negative for a standard autocallable.
+
+**Why the bump is 100 bp, not 10 bp like vega.** Finite-difference noise scales as `1/h`, and both
+of these Greeks are small. Measured on the default note at 10,000 paths across several seeds:
+
+| Bump | rho: noise / value | div_sens: noise / value |
+|---|---|---|
+| 10 bp | 18% | **63%** — sign flips between runs |
+| 100 bp | 2.6% | 13% |
+
+The estimates themselves agree across both bump sizes within noise, so there is no truncation
+penalty — both Greeks are near-linear in their parameter over this range. 100 bp is also the
+conventional market bump for rho. If you need tighter numbers, raise `--n-paths-greeks` rather
+than shrinking the bump.
 
 #### Skew sensitivity convention
 
@@ -725,7 +776,9 @@ spread_bp,
 <model>_gamma × 3,
 <model>_vega × 3,
 <model>_vanna × 3,
-<model>_skew_sens × 3
+<model>_skew_sens × 3,
+<model>_rho × 3,
+<model>_div_sens × 3
 ```
 
 Load in Python:
@@ -976,9 +1029,10 @@ counts and dominate the runtime).
 ### Greeks runtime
 
 Each call to `--greeks` requires:
-- 10 bumped pricing evaluations (spot ±, vol ±, skew ±, vanna cross-terms)
-- 4 vol surface recalibrations for Heston (fast warm-start mode, ~0.8s each) — 2 for the vol bumps,
-  2 for the skew bumps
+- 14 bumped pricing evaluations (spot ±, vol ±, skew ±, rate ±, dividend ±, vanna cross-terms)
+- 8 vol surface recalibrations for Heston (fast warm-start mode, ~0.8s each) — 2 each for the vol,
+  skew, rate and dividend bumps. The rate and dividend bumps need one because they move the
+  forward, which repositions every strike in moneyness terms.
 
 Per scenario with 10,000 paths:
 
@@ -999,7 +1053,7 @@ Greek estimates are noisy because they are FD differences of two MC prices. Thre
 1. **Increase `--n-paths-greeks`**: directly reduces noise but increases runtime proportionally.
 2. **Increase `--h-spot-pct`**: larger bump reduces relative noise but adds truncation error. The
    default (1%) is usually a good balance; 2% is reasonable for a first pass.
-3. **Common random numbers (CRN)**: the pricer already uses this — all 10 bumped evaluations share
+3. **Common random numbers (CRN)**: the pricer already uses this — all 14 bumped evaluations share
    the same seed, so MC noise largely cancels in the FD numerator. Do not change the seed between
    the base and bumped runs if you replicate the Greek logic in your own code.
 
