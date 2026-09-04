@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import subprocess
 import sys
 import time
@@ -164,6 +165,42 @@ def model_colors(models: list[str]) -> tuple[list[str], list[str]]:
     return list(models), out
 
 
+
+MANUAL_PATH = os.path.join(ROOT, "USER_MANUAL.md")
+
+
+def manual_sections() -> list[tuple[str, str]]:
+    """
+    Split USER_MANUAL.md into (heading, body) pairs on its top-level `## `
+    headings.
+
+    The manual is ~1300 lines. Rendering it whole makes it unreadable and slow,
+    and Streamlit has no in-page anchors, so the document's own table of
+    contents links would not work anyway. Splitting lets the reader jump
+    straight to a section, which is what the TOC was for.
+    """
+    if not os.path.exists(MANUAL_PATH):
+        return []
+    lines = open(MANUAL_PATH, encoding="utf-8").read().splitlines(keepends=True)
+    sections: list[tuple[str, list[str]]] = []
+    preamble: list[str] = []
+    fenced = False
+    for line in lines:
+        # Never treat a "## " inside a fenced code block as a heading.
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        if not fenced and line.startswith("## "):
+            sections.append((line[3:].strip(), [line]))
+        elif sections:
+            sections[-1][1].append(line)
+        else:
+            preamble.append(line)
+    out = [(h, "".join(b)) for h, b in sections]
+    if preamble and "".join(preamble).strip():
+        out.insert(0, ("(front matter)", "".join(preamble)))
+    return out
+
+
 # ── header ────────────────────────────────────────────────────────────────────
 
 st.title("Autocall Pricer")
@@ -173,7 +210,8 @@ st.caption(
     "Everything runs through the existing CLI, unchanged."
 )
 
-tab_edit, tab_run, tab_results = st.tabs(["Inputs", "Run", "Results"])
+tab_edit, tab_run, tab_results, tab_manual = st.tabs(
+    ["Inputs", "Run", "Results", "Manual"])
 
 
 # ── 1. edit inputs ────────────────────────────────────────────────────────────
@@ -198,6 +236,15 @@ with tab_edit:
         if st.session_state.get("_loaded_file") != chosen:
             st.session_state["editor"] = on_disk
             st.session_state["_loaded_file"] = chosen
+            # Point Save-As at the folder this file came from. Streamlit
+            # widget state is sticky once a key exists, so the radio's `index`
+            # is honoured only on its first render -- the default has to be
+            # pushed through session_state instead, or the folder silently
+            # keeps whatever was chosen last.
+            _d = os.path.dirname(chosen)
+            st.session_state["saveas_dir"] = (
+                _d if _d in ("configs", "scenarios") else "configs")
+            st.session_state.pop("saveas_name", None)
 
         if st.button("Reload from disk", width="stretch"):
             st.session_state["editor"] = on_disk
@@ -231,15 +278,61 @@ with tab_edit:
     with c2:
         save_as = st.popover("Save as…", width="stretch")
         with save_as:
-            new_name = st.text_input("New file name", value="config_new.yaml")
-            if st.button("Create in configs/", disabled=bool(err)):
-                dest = os.path.join(ROOT, "configs", new_name)
-                if os.path.exists(dest):
-                    st.error("That file already exists.")
-                else:
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    open(dest, "w").write(text)
-                    st.success(f"Created configs/{new_name}")
+            # The destination has to be selectable, not fixed. The Run tab
+            # reads --config from configs/ and --scenarios from scenarios/,
+            # so hardcoding one of them makes the other kind of file
+            # impossible to create here.
+            folders = ["configs", "scenarios"]
+            # No index= here: session_state drives this widget (set when the
+            # opened file changes, above). Passing both makes Streamlit warn
+            # that a default and a session-state value are competing.
+            st.session_state.setdefault("saveas_dir", "configs")
+            dest_dir = st.radio(
+                "Folder", folders,
+                horizontal=True,
+                captions=["deal configs (--config)", "scenario specs (--scenarios)"],
+                key="saveas_dir",
+            )
+            default_name = ("sce_new.yaml" if dest_dir == "scenarios"
+                            else "config_new.yaml")
+            if st.session_state.get("_saveas_dir_prev") != dest_dir:
+                st.session_state["_saveas_dir_prev"] = dest_dir
+                st.session_state.pop("saveas_name", None)
+            new_name = st.text_input("New file name", value=default_name,
+                                     key="saveas_name")
+            if not new_name.endswith((".yaml", ".yml")):
+                new_name = new_name + ".yaml"
+            rel = f"{dest_dir}/{new_name}"
+            st.caption(f"→ `{rel}`")
+
+            # Non-blocking shape hint. A scenario spec needs base_config and
+            # scenarios; a deal config needs product. Getting this wrong is
+            # easy and the failure would otherwise surface much later, as a
+            # KeyError in the middle of a run.
+            if not err and isinstance(parsed, dict):
+                if dest_dir == "scenarios" and not (
+                        "scenarios" in parsed and "base_config" in parsed):
+                    st.warning(
+                        "This doesn't look like a scenario spec — those need "
+                        "`base_config:` and `scenarios:` at the top level."
+                    )
+                elif dest_dir == "configs" and "product" not in parsed \
+                        and "assets" not in parsed:
+                    st.warning(
+                        "This doesn't look like a deal config — those need "
+                        "`product:` (or `assets:` for a basket)."
+                    )
+
+            exists = os.path.exists(os.path.join(ROOT, rel))
+            if exists:
+                st.error(f"`{rel}` already exists — pick another name.")
+            if st.button(f"Create {rel}", disabled=bool(err) or exists,
+                         type="primary"):
+                dest = os.path.join(ROOT, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest, "w").write(text)
+                st.success(f"Created {rel}")
+                st.rerun()
     with c3:
         if err:
             st.error("Invalid YAML — cannot save")
@@ -481,3 +574,63 @@ with tab_results:
         st.dataframe(df, width="stretch")
         st.download_button("Download", df.to_csv(index=False),
                            file_name=os.path.basename(pick), mime="text/csv")
+
+
+# ── 4. manual ─────────────────────────────────────────────────────────────────
+
+with tab_manual:
+    sections = manual_sections()
+    if not sections:
+        st.error(f"USER_MANUAL.md not found at `{MANUAL_PATH}`.")
+    else:
+        titles = [h for h, _ in sections]
+        query = st.text_input(
+            "Search the manual", placeholder="e.g. sticky leverage, rho, antithetic",
+            key="manual_q",
+        )
+
+        if query.strip():
+            # Match on a normalised form so a natural-language query finds the
+            # code-style spelling: "sticky leverage" should hit
+            # `sticky_leverage`, and "h rate" should hit `--h-rate`. Underscores
+            # and hyphens fold to spaces on BOTH sides, and runs of whitespace
+            # collapse. The original text is still what gets rendered.
+            def norm(t: str) -> str:
+                return " ".join(re.sub(r"[_\-]+", " ", t.lower()).split())
+
+            q = norm(query)
+            hits = [(h, b, norm(b).count(q)) for h, b in sections if q in norm(b)]
+            if not hits:
+                st.info(f"No match for “{query}”.")
+            else:
+                st.caption(
+                    f"{sum(n for _, _, n in hits)} match(es) in "
+                    f"{len(hits)} section(s) — most matches first"
+                )
+                for h, body, n in sorted(hits, key=lambda x: -x[2]):
+                    with st.expander(f"{h}  ·  {n} match(es)"):
+                        st.markdown(body)
+        else:
+            col_nav, col_body = st.columns([1, 3])
+            with col_nav:
+                chosen_sec = st.radio(
+                    "Section", titles,
+                    index=titles.index("1. Overview") if "1. Overview" in titles else 0,
+                    label_visibility="collapsed",
+                    key="manual_sec",
+                )
+            with col_body:
+                st.markdown(dict(sections)[chosen_sec])
+
+        st.divider()
+        st.caption(
+            "Rendered from `USER_MANUAL.md` in the repo, so it is never out of "
+            "step with the code. Cross-references like “see §12” are section "
+            "numbers in the list on the left — Streamlit has no in-page anchors, "
+            "so the document's own links are inert here."
+        )
+        st.download_button(
+            "Download USER_MANUAL.md",
+            open(MANUAL_PATH, encoding="utf-8").read(),
+            file_name="USER_MANUAL.md", mime="text/markdown",
+        )

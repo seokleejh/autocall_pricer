@@ -1300,9 +1300,23 @@ Two things follow from that, both deliberate:
 
 | Tab | Does |
 |---|---|
-| **Inputs** | Pick any YAML under `config.yaml`, `configs/` or `scenarios/`; edit it as raw text; save. |
+| **Inputs** | Pick any YAML under `config.yaml`, `configs/` or `scenarios/`; edit it as raw text; save, or **Save as…** into either folder. |
 | **Run** | Choose a script, set its flags, see the exact command, run it with live output. |
 | **Results** | Load any CSV from `results/` or `scenarios/`; prices, model spread and Greeks as tables and charts. |
+| **Manual** | This document, rendered from the repo — section navigation plus full-text search. |
+
+**Save as…** asks which folder to write to, defaulting to wherever the open file
+lives. That choice matters: the Run tab reads `--config` from `configs/` and
+`--scenarios` from `scenarios/`, so a file written to the wrong one is invisible
+to the command that needs it. It also warns (without blocking) when the document
+shape does not match the folder — a scenario spec needs `base_config:` and
+`scenarios:`, a deal config needs `product:` or `assets:`.
+
+The **Manual** tab splits this file on its `## ` headings rather than rendering
+1,300 lines in one scroll; Streamlit has no in-page anchors, so the table of
+contents above would be inert there and the section list replaces it. Search
+folds underscores and hyphens to spaces, so `sticky leverage` finds
+`sticky_leverage` and `h rate` finds `--h-rate`.
 
 ### Why raw YAML instead of form widgets
 
