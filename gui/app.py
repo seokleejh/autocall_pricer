@@ -125,6 +125,45 @@ def run_streaming(cmd: list[str], out_area) -> int:
     return code
 
 
+# ── categorical palette ───────────────────────────────────────────────────────
+# Validated slots (dataviz validate_palette.js, --pairs all): light CVD dE 9.2 /
+# normal-vision 24.0; dark 9.4 / 20.9. Both modes pass every hard gate.
+#
+# Colour is bound to the MODEL NAME, never to column position. An archived CSV
+# holding only Local Vol and Heston therefore paints them the same hues as a
+# current file that also has LSV -- a reader who learned "Heston is orange" is
+# not misled by opening a different file.
+_SLOTS_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+_SLOTS_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]
+_MODEL_SLOT = {
+    "Local Vol": 0, "Basket Local Vol": 0,
+    "Heston": 1, "Basket Heston": 1,
+    "LSV": 2, "Basket LSV": 2,
+    "SABR": 3,
+}
+
+
+def _is_dark() -> bool:
+    try:
+        return getattr(st.context.theme, "type", "light") == "dark"
+    except Exception:
+        return False
+
+
+def model_colors(models: list[str]) -> tuple[list[str], list[str]]:
+    """(domain, range) for an Altair colour scale, keyed on model name."""
+    slots = _SLOTS_DARK if _is_dark() else _SLOTS_LIGHT
+    used: set[int] = set()
+    out: list[str] = []
+    for m in models:
+        i = _MODEL_SLOT.get(m)
+        if i is None or i in used:
+            i = next(k for k in range(len(slots)) if k not in used)
+        used.add(i)
+        out.append(slots[i % len(slots)])
+    return list(models), out
+
+
 # ── header ────────────────────────────────────────────────────────────────────
 
 st.title("Autocall Pricer")
@@ -336,16 +375,44 @@ with tab_results:
 
     if alt is not None:
         long = price_df.reset_index().melt("scenario", var_name="model", value_name="price")
+        domain, rng = model_colors(models)
+        order = list(price_df.index)
+        base = alt.Chart(long)
+
+        # A DOT plot, not bars. Every price here sits between roughly 1.02 and
+        # 1.13, and the thing worth seeing is the gap BETWEEN models. Bars
+        # cannot show that: a bar encodes length, so it needs a zero baseline
+        # to be honest, and against a 0-1.2 axis a 1% spread is invisible.
+        # (Vega-Lite enforces this -- it overrides scale zero=False on a bar
+        # mark, precisely so nobody ships a truncated bar.)
+        #
+        # A dot encodes position rather than length, carries no baseline claim,
+        # and so the axis can legitimately zoom to the data range.
+        #
+        # Each model gets its own offset line within the scenario band. Without
+        # that the dots overlap wherever the models agree closely, and a hidden
+        # dot is indistinguishable from an absent model.
+        dots = base.mark_circle(
+            size=95, opacity=1.0,
+            stroke="#1a1a19" if _is_dark() else "#fcfcfb", strokeWidth=1.5,
+        ).encode(
+            y=alt.Y("scenario:N", sort=order, title=None,
+                    axis=alt.Axis(labelLimit=240)),
+            yOffset=alt.YOffset("model:N", sort=models),
+            x=alt.X("price:Q", scale=alt.Scale(zero=False, nice=True),
+                    title="price (per unit notional)"),
+            color=alt.Color("model:N", sort=models, title="model",
+                            scale=alt.Scale(domain=domain, range=rng)),
+            tooltip=["scenario", "model",
+                     alt.Tooltip("price:Q", title="price", format=".6f")],
+        )
         st.altair_chart(
-            alt.Chart(long).mark_bar().encode(
-                x=alt.X("model:N", title=None, axis=alt.Axis(labels=False)),
-                y=alt.Y("price:Q", scale=alt.Scale(zero=False), title="price"),
-                color=alt.Color("model:N", title="model"),
-                column=alt.Column("scenario:N", title=None,
-                                  header=alt.Header(labelAngle=-60, labelAlign="right")),
-                tooltip=["scenario", "model", alt.Tooltip("price:Q", format=".6f")],
-            ).properties(width=42, height=240),
-            width="content",
+            dots.properties(height=max(300, 40 * len(price_df))),
+            width="stretch",
+        )
+        st.caption(
+            "Axis is zoomed to the data range — legitimate for dots, which encode "
+            "position rather than length. Spread between models is quantified below."
         )
 
     # -- model spread ---------------------------------------------------------
@@ -363,10 +430,49 @@ with tab_results:
         st.subheader("Greeks")
         chosen_g = st.selectbox("Measure", present, key="res_greek")
         cols = [f"{m}_{chosen_g}" for m in models]
-        g_df = df[["scenario"] + cols].set_index("scenario")
-        g_df.columns = models
-        st.dataframe(g_df.style.format("{:+.6f}"), width="stretch")
-        st.bar_chart(g_df, height=280)
+        g_df = df[["scenario"] + cols].copy()
+        g_df.columns = ["scenario"] + models
+
+        # Table first. It is the accessible twin of the chart, and it also
+        # discharges the light-mode contrast warning on the third colour slot.
+        st.dataframe(g_df.set_index("scenario").style.format("{:+.6f}"),
+                     width="stretch")
+
+        if alt is not None:
+            long = g_df.melt("scenario", var_name="model", value_name="value")
+            domain, rng = model_colors(models)
+            base = alt.Chart(long)
+
+            # GROUPED, never stacked. A delta under Local Vol and a delta under
+            # Heston are competing answers to the same question, not components
+            # of one quantity -- their sum has no meaning, so a stacked height
+            # would draw a number that does not exist. st.bar_chart() stacks by
+            # default, which is exactly the bug this replaces.
+            #
+            # Horizontal because the scenario labels are long; vertical would
+            # need rotated text and a taller axis band. Zero-based x, because
+            # for a Greek zero is a real value (no sensitivity) and the sign
+            # carries meaning -- several of these measures go negative.
+            bars = base.mark_bar().encode(
+                y=alt.Y("scenario:N", title=None,
+                        sort=list(g_df["scenario"]),
+                        axis=alt.Axis(labelLimit=240)),
+                yOffset=alt.YOffset("model:N", sort=models),
+                x=alt.X("value:Q", title=chosen_g,
+                        scale=alt.Scale(zero=True)),
+                color=alt.Color("model:N", sort=models, title="model",
+                                scale=alt.Scale(domain=domain, range=rng)),
+                tooltip=["scenario", "model",
+                         alt.Tooltip("value:Q", title=chosen_g, format="+.6f")],
+            )
+            zero = base.mark_rule(strokeWidth=1, opacity=0.45).encode(
+                x=alt.datum(0))
+            st.altair_chart(
+                (bars + zero).properties(height=max(280, 34 * len(g_df))),
+                width="stretch")
+        else:
+            # stack=False matters here for the same reason as above.
+            st.bar_chart(g_df.set_index("scenario"), height=300, stack=False)
     else:
         st.caption("No Greeks in this file — re-run with `--greeks` to populate them.")
 
